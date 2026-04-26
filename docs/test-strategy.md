@@ -36,3 +36,8 @@ This document outlines the testing strategy for the Quantum Bunker project, prio
 - **Cleanup:** Clear memory stores, EventBus listeners, and sockets after every test using `afterEach`.
 - **No Sleeps:** Await specific events rather than arbitrary `setTimeout`.
 - **Mocks vs Fakes:** Use fakes for memory stores and DI adapters. Mock the logger to assert zero-knowledge.
+
+## Additional Test Types
+- **Smoke Tests:** Quick sanity checks that the core flow (session creation, host join, message relay) works. Implemented in `tests/smoke/`.
+- **Stress Tests:** Simulate many concurrent peers (e.g., 30) sending messages in a single session to validate routing under load. Implemented in `tests/stress/`.
+- **Load Tests:** Use worker threads to create a large number of connections (e.g., 200) and assess server stability under high volume. Implemented in `tests/load/`.
