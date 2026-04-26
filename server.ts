@@ -9,7 +9,7 @@ import { createContainer } from './src/backend/entrypoints/container';
 import { CreateSessionRequestSchema } from './src/shared/contracts/v1/schemas';
 import { CLEANUP_INTERVAL_MS } from './src/backend/core/constants';
 
-async function startServer() {
+export async function setupApp() {
   const app = express();
   const server = createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -18,7 +18,7 @@ async function startServer() {
   const container = createContainer(wss);
 
   // Background Tasks
-  setInterval(() => {
+  const cleanupInterval = setInterval(() => {
     container.cleanupSessions.execute().catch(err => {
       console.error('Cleanup task failed:', err);
     });
@@ -119,6 +119,11 @@ async function startServer() {
     });
   }
 
+  return { app, server, wss, container, PORT, cleanupInterval };
+}
+
+async function startServer() {
+  const { server, PORT } = await setupApp();
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Quantum Bunker running on http://0.0.0.0:${PORT}`);
   });
