@@ -59,9 +59,10 @@ Quantum Bunker is a zero-knowledge, secure, ephemeral chat application built for
 
 ## 🚢 Deployment Strategy
 
-- **`master` branch**: Production-ready code.
-- **`main` branch**: Active development and integration branch.
-- **Daily Deployments**: All new changes merged into `main` are bundled and deployed to the `master` branch at **12 AM PST everyday**, ensuring the main app stays continuously updated and stable.
+- **`main` branch**: Production-ready code.
+- **`staging` branch**: Pre-prod and smoke testing.
+- **`develop` branch**: Active daily development.
+- **Deployments**: We use GitHub Environments and Rulesets. Code flows from `feature/*` -> `develop` -> `staging` -> `main`. See `docs/workflow.md` for full details.
 
 ## 🤝 Contributing
 

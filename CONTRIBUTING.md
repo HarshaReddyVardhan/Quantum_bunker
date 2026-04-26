@@ -20,11 +20,12 @@ This section guides you through submitting an enhancement suggestion, including 
 *   Provide a compelling reason why this enhancement would be useful to most users.
 
 ### Git Workflow & Branching Strategy
-We follow a strict branching model to ensure stability in production:
-*   **`master`**: The **production-ready** branch. All code here is deployed to the live app.
-*   **`main`**: The **development** branch. All new code and PRs should be pushed here.
-*   **Deployment**: Changes merged into `main` during the day are deployed to the `master` branch (and subsequently to the live app) automatically at **12 AM PST** every day.
-*   **Features**: Please **fork** the repository, create a new branch from `main` (e.g., `feature/my-new-feature`), and submit your Pull Request against the `main` branch.
+We follow a strict branching model to ensure stability in production. Please see `docs/workflow.md` for full details on CI/CD pipelines, branch protections, and deployment environments.
+*   **`main`**: The **production-ready** branch. All code here is deployed to the live app.
+*   **`staging`**: The **pre-prod / smoke testing** branch.
+*   **`develop`**: The **daily development** branch. All new features are merged here first.
+*   **`feature/*`**: Branches for every task, fix, or PR. Create from `develop`.
+*   **Merge Flow**: `feature/*` → `develop` → `staging` → `main`.
 
 ### Pull Requests
 *   Fill in the required template.
