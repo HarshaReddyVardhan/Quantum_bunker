@@ -1,0 +1,6 @@
+{
+  "name": "Quantum Bunker",
+  "description": "Zero-knowledge, 2-peer real-time communication relay with end-to-end encryption support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
