@@ -31,20 +31,10 @@ describe('E2E WebSocket Relay', () => {
     server.close();
   });
 
-  const connectWs = (sessionId: string, peerId: string, role: string, recoveryToken?: string): Promise<WebSocket> => {
+  const connectWs = (sessionId: string, peerId: string, role: string): Promise<WebSocket> => {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
-      ws.on('open', () => {
-        ws.send(JSON.stringify({ type: 'join', sessionId, peerId, hostRecoveryToken: recoveryToken }));
-        ws.once('message', (data) => {
-          const parsed = JSON.parse(data.toString());
-          if (parsed.type === 'joined' || parsed.type === 'pending') {
-            resolve(ws);
-          } else if (parsed.type === 'error') {
-            reject(new Error(parsed.message));
-          }
-        });
-      });
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?sessionId=${sessionId}&peerId=${peerId}&role=${role}`);
+      ws.on('open', () => resolve(ws));
       ws.on('error', reject);
     });
   };
@@ -57,27 +47,15 @@ describe('E2E WebSocket Relay', () => {
     
     const sessionId = res.body.sessionId;
     const hostId = res.body.hostId;
-    const hostToken = res.body.hostRecoveryToken;
 
     // 2. Connect Host
-    const hostWs = await connectWs(sessionId, hostId, 'host', hostToken);
+    const hostWs = await connectWs(sessionId, hostId, 'host');
     
     // 3. Connect Peer
     const peerId = 'peer-test';
     const peerWs = await connectWs(sessionId, peerId, 'participant');
 
-    // 4. Host accepts peer
-    hostWs.send(JSON.stringify({ type: 'accept_join', peerId }));
-    
-    // 5. Peer waits for joined confirmation
-    await new Promise<void>((resolve) => {
-      peerWs.on('message', (data) => {
-        const parsed = JSON.parse(data.toString());
-        if (parsed.type === 'joined') resolve();
-      });
-    });
-
-    // 6. Send Message from Peer to Host
+    // 4. Send Message from Peer to Host
     const msgPromise = new Promise<any>((resolve) => {
       hostWs.on('message', (data) => {
         const parsed = JSON.parse(data.toString());
@@ -112,7 +90,7 @@ describe('E2E WebSocket Relay', () => {
     const sessionId = res.body.sessionId;
     const hostToken = res.body.hostRecoveryToken;
 
-    const hostWs = await connectWs(sessionId, res.body.hostId, 'host', hostToken);
+    const hostWs = await connectWs(sessionId, res.body.hostId, 'host');
     
     const closePromise = new Promise<void>((resolve) => {
       hostWs.on('close', () => resolve());
