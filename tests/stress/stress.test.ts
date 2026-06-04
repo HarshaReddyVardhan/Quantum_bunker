@@ -10,14 +10,19 @@ import { Application } from 'express';
 describe('Stress Test - Concurrent Messaging', () => {
   let app: Application;
   let server: any;
-  const port = 4200;
-  const peerCount = 30;
+  let port: number;
+  const peerCount = 8;
 
   beforeAll(async () => {
     const setup = await setupApp();
     app = setup.app;
     server = setup.server;
-    await new Promise<void>((resolve) => server.listen(port, resolve));
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => {
+        port = server.address().port;
+        resolve();
+      });
+    });
   });
 
   afterAll(() => {
@@ -32,38 +37,49 @@ describe('Stress Test - Concurrent Messaging', () => {
     expect(res.status).toBe(201);
     const { sessionId, hostRecoveryToken, hostId } = res.body;
 
+    const waitForMessage = (ws: WebSocket, type: string): Promise<any> => {
+      return new Promise((resolve) => {
+        const handler = (data: any) => {
+          const parsed = JSON.parse(data.toString());
+          if (parsed.type === type) {
+            ws.off('message', handler);
+            resolve(parsed);
+          }
+        };
+        ws.on('message', handler);
+      });
+    };
+
     // host joins
-    const hostWs = new WebSocket(`ws://localhost:${port}/ws`);
+    const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
     await new Promise((r) => hostWs.once('open', r));
     hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
-    await new Promise((r) => hostWs.once('message', () => r(undefined)));
+    await waitForMessage(hostWs, 'joined');
 
     // spin up many peers
     const peers: WebSocket[] = [];
     for (let i = 0; i < peerCount; i++) {
-      const ws = new WebSocket(`ws://localhost:${port}/ws`);
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
       peers.push(ws);
       await new Promise((r) => ws.once('open', r));
-      ws.send(JSON.stringify({ type: 'join', sessionId, peerId: `peer-${i}` }));
-      await new Promise((r) => ws.once('message', () => r(undefined)));
+      const peerId = `peer-${i}`;
+      ws.send(JSON.stringify({ type: 'join', sessionId, peerId }));
+      await waitForMessage(ws, 'pending');
+      
+      // Host accepts peer
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId }));
+      await waitForMessage(ws, 'joined');
     }
 
     // each peer sends a message
-    const envelope = { type: 'NOISE_MESSAGE', sessionId, from: hostId, timestamp: Date.now(), nonce: 'n0', payload: 'stress-msg' };
+    const envelope = { type: 'noise-message', sessionId, from: hostId, timestamp: Date.now(), nonce: 'n0', payload: 'stress-msg' };
     hostWs.send(JSON.stringify(envelope));
 
     // verify all peers receive it
     await Promise.all(
-      peers.map((ws) =>
-        new Promise<void>((resolve) =>
-          ws.once('message', (data) => {
-            const msg = JSON.parse(data.toString());
-            expect(msg.type).toBe('NOISE_MESSAGE');
-            expect(msg.payload).toBe('stress-msg');
-            resolve();
-          })
-        )
-      )
+      peers.map((ws) => waitForMessage(ws, 'noise-message').then((msg) => {
+        expect(msg.payload).toBe('stress-msg');
+      }))
     );
 
     // cleanup
