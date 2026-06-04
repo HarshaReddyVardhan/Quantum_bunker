@@ -165,8 +165,11 @@ export class WsTransport implements IRelayTransport {
           const targetPeer = raw.peerId;
           if (session.pendingPeers && session.pendingPeers[targetPeer]) {
             delete session.pendingPeers[targetPeer];
+            const alreadyJoined = !!session.peers[targetPeer];
             session.peers[targetPeer] = { id: targetPeer, joinedAt: Date.now(), lastSeenAt: Date.now() };
-            session.participantCount = (session.participantCount || 0) + 1;
+            if (!alreadyJoined) {
+              session.participantCount = (session.participantCount || 0) + 1;
+            }
             if (session.participantCount > 2) {
               session.isGroup = true;
             }
