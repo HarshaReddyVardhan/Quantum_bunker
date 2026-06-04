@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { CreateSessionResponse } from './shared/contracts/v1/session';
 
 export interface SavedSession {
@@ -23,6 +23,7 @@ export function useSession() {
     const saved = localStorage.getItem('qb-saved-sessions');
     return saved ? JSON.parse(saved) : [];
   });
+  const refreshedRef = useRef(false);
 
   useEffect(() => {
     localStorage.setItem('qb-saved-sessions', JSON.stringify(savedSessions));
@@ -180,8 +181,11 @@ export function useSession() {
         setIsExpired(false);
         
         // Auto-refresh if less than 2 minutes left
-        if (diff < 2 * 60 * 1000) {
-          refreshSession();
+        if (diff < 2 * 60 * 1000 && !refreshedRef.current) {
+          refreshedRef.current = true;
+          refreshSession()?.finally(() => {
+            refreshedRef.current = false;
+          });
         }
         return true;
       }

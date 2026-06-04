@@ -104,14 +104,14 @@ export async function setupApp() {
     res.status(204).send();
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== 'production') {
+  // Vite middleware for development (skip in test environments)
+  if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (process.env.NODE_ENV === 'production') {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
@@ -129,7 +129,9 @@ async function startServer() {
   });
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
+  startServer().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}

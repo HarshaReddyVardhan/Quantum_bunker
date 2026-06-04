@@ -261,6 +261,7 @@ export class WsTransport implements IRelayTransport {
         
         const session = await this.store.get(currentSessionId);
         if (session && session.peers[currentPeerId]) {
+          delete session.peers[currentPeerId];
           session.participantCount = Math.max(0, (session.participantCount || 1) - 1);
           if (session.participantCount === 0) {
             session.emptySince = Date.now();
