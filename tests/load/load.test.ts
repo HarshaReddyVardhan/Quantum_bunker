@@ -12,7 +12,7 @@ import { Worker } from 'worker_threads';
 describe('Load Test - High Volume Messaging', () => {
   let app: Application;
   let server: any;
-  let port: number;
+  const port = 4300;
   const totalPeers = 200; // total concurrent peers
   const workers = 4; // number of worker threads
   const peersPerWorker = Math.ceil(totalPeers / workers);
@@ -21,12 +21,7 @@ describe('Load Test - High Volume Messaging', () => {
     const setup = await setupApp();
     app = setup.app;
     server = setup.server;
-    await new Promise<void>((resolve) => {
-      server.listen(0, '127.0.0.1', () => {
-        port = server.address().port;
-        resolve();
-      });
-    });
+    await new Promise<void>((resolve) => server.listen(port, resolve));
   });
 
   afterAll(() => {
@@ -49,13 +44,13 @@ describe('Load Test - High Volume Messaging', () => {
 
     // function to run in worker
     const workerCode = `
-      const { parentPort, workerData, threadId } = require('worker_threads');
+      const { parentPort } = require('worker_threads');
       const WebSocket = require('ws');
       const peers = [];
       const { sessionId, port, count } = workerData;
       (async () => {
         for (let i = 0; i < count; i++) {
-          const ws = new WebSocket(\`ws://localhost:\${port}/ws\`);
+          const ws = new WebSocket(`ws://localhost:${port}/ws`);
           await new Promise(r => ws.once('open', r));
           ws.send(JSON.stringify({ type: 'join', sessionId, peerId: 'peer-' + i + '-' + threadId }));
           await new Promise(r => ws.once('message', () => r(undefined)));

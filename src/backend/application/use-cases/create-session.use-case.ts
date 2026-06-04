@@ -17,25 +17,24 @@ export class CreateSession {
     
     const actualTtl = Math.min(ttl, SESSION_LIMITS.MAX_TTL_MS);
     
-    const now = Date.now();
     const hostId = `host-${Math.random().toString(36).substring(2, 8)}`;
     const hostRecoveryToken = uuidv4();
     const sess: Session = {
       id: uuidv4(),
       name,
-      createdAt: now,
-      expiresAt: now + actualTtl,
-      lastActivityAt: now,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + actualTtl,
+      lastActivityAt: Date.now(),
       hostId,
       hostRecoveryToken,
       peers: {
-        [hostId]: { id: hostId, joinedAt: now, lastSeenAt: now }
+        [hostId]: { id: hostId, joinedAt: Date.now(), lastSeenAt: Date.now() }
       },
       pendingPeers: {},
       status: SessionStatus.PENDING,
       maxPeers: SESSION_LIMITS.MAX_PEERS,
       participantCount: 0,
-      emptySince: now,
+      emptySince: Date.now(),
     };
 
     await this.store.save(sess);
