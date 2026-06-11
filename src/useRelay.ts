@@ -17,10 +17,14 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   const [isGroup, setIsGroup] = useState(false);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [ioLoad, setIoLoad] = useState<number>(0);
+  const [peerAliases, setPeerAliases] = useState<Record<string, string>>({});
+  const [typingAt, setTypingAt] = useState<Record<string, number>>({});
   const socketRef = useRef<WebSocket | null>(null);
   const readSentRef = useRef<Set<string>>(new Set());
   const pingTimestampRef = useRef<Map<string, number>>(new Map());
   const bytesInWindowRef = useRef<number>(0);
+  const typingStopRef = useRef<number | null>(null);
+  const typingSentAtRef = useRef<number>(0);
 
   // Disappear messages after 5 mins
   useEffect(() => {
@@ -48,6 +52,18 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       bytesInWindowRef.current += data.length;
     }
   }, []);
+
+  const sendSignal = useCallback((obj: Record<string, unknown>) => {
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN || !sessionId || !peerId) return;
+    sendRaw({
+      sessionId,
+      from: peerId,
+      type: EnvelopeType.SIGNALING,
+      timestamp: Date.now(),
+      nonce: Math.random().toString(36).substring(7),
+      payload: JSON.stringify(obj),
+    });
+  }, [sessionId, peerId, sendRaw]);
 
   const connect = useCallback(() => {
     if (!sessionId || !peerId) return;
@@ -143,6 +159,27 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
         return;
       }
 
+      // SIGNALING payloads are client-interpreted control frames (typing/alias);
+      // the server forwards them opaquely and never inspects the contents.
+      if (env.type === EnvelopeType.SIGNALING) {
+        try {
+          const sig = JSON.parse(env.payload);
+          if (sig.kind === 'typing') {
+            setTypingAt(prev => {
+              if (sig.state) return { ...prev, [env.from]: Date.now() };
+              const { [env.from]: _removed, ...rest } = prev;
+              return rest;
+            });
+          } else if (sig.kind === 'alias' && typeof sig.alias === 'string' && sig.alias.trim()) {
+            const alias = sig.alias.trim().slice(0, 32);
+            setPeerAliases(prev => (prev[env.from] === alias ? prev : { ...prev, [env.from]: alias }));
+          }
+        } catch {
+          // Ignore malformed signaling frames
+        }
+        return;
+      }
+
       // Handle normal message
       if (env.type === EnvelopeType.PLAINTEXT || env.type === EnvelopeType.NOISE_MESSAGE) {
         setMessages(prev => {
@@ -188,14 +225,38 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     };
 
     sendRaw(envelope);
-    
+
+    if (typingStopRef.current) {
+      clearTimeout(typingStopRef.current);
+      typingStopRef.current = null;
+    }
+    if (typingSentAtRef.current) {
+      typingSentAtRef.current = 0;
+      sendSignal({ kind: 'typing', state: false });
+    }
+
     setMessages(prev => [...prev, {
       ...envelope,
       status: 'sent',
       deliveredTo: [],
       seenBy: []
     }]);
-  }, [isConnected, sessionId, peerId, activePeers.length, sendRaw]);
+  }, [isConnected, sessionId, peerId, activePeers.length, sendRaw, sendSignal]);
+
+  const sendTyping = useCallback(() => {
+    if (activePeers.length <= 1) return;
+    const now = Date.now();
+    if (now - typingSentAtRef.current > 2000) {
+      typingSentAtRef.current = now;
+      sendSignal({ kind: 'typing', state: true });
+    }
+    if (typingStopRef.current) clearTimeout(typingStopRef.current);
+    typingStopRef.current = window.setTimeout(() => {
+      typingSentAtRef.current = 0;
+      typingStopRef.current = null;
+      sendSignal({ kind: 'typing', state: false });
+    }, 3000);
+  }, [activePeers.length, sendSignal]);
 
   const markAsRead = useCallback((nonce: string) => {
     if (!sessionId || !peerId || readSentRef.current.has(nonce)) return;
@@ -238,6 +299,28 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     return () => clearInterval(interval);
   }, [isConnected, sessionId, peerId, sendRaw]);
 
+  // Announce our display alias on connect and whenever the peer set changes,
+  // so newly joined peers learn how to label us.
+  useEffect(() => {
+    if (!isConnected || activePeers.length <= 1) return;
+    const alias = (localStorage.getItem('qb-join-msg') || '').trim();
+    if (alias && alias.toLowerCase() !== 'hello') {
+      sendSignal({ kind: 'alias', alias: alias.slice(0, 32) });
+    }
+  }, [isConnected, activePeers.length, sendSignal]);
+
+  // Expire typing indicators if no explicit "stop" frame arrives.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTypingAt(prev => {
+        const now = Date.now();
+        const next = Object.fromEntries(Object.entries(prev).filter(([, t]) => now - (t as number) < 4000));
+        return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   const acceptJoin = useCallback((targetPeerId: string) => {
     if (!socketRef.current) return;
     socketRef.current.send(JSON.stringify({ type: 'accept_join', peerId: targetPeerId }));
@@ -255,5 +338,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     socketRef.current.send(JSON.stringify({ type: 'kick_peer', peerId: targetPeerId }));
   }, []);
 
-  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad };
+  const typingPeers = Object.keys(typingAt).filter(id => id !== peerId);
+
+  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers };
 }
