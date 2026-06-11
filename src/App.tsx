@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Lock, Send, Plus, LogIn, Copy, Check, Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Activity, Terminal, Sun, Moon, Menu, X, Share2, QrCode } from 'lucide-react';
+import { Lock, Send, Plus, LogIn, Copy, Check, Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, Sun, Moon, Menu, X, Share2, QrCode } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useRelay } from './useRelay';
 import { useSession } from './useSession';
@@ -502,7 +502,7 @@ interface ChatRoomProps {
 }
 
 function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft, isExpired, securityOptions, reset }: ChatRoomProps) {
-  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers } = useRelay(sessionId, peerId);
+  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, p2pPeers, transport } = useRelay(sessionId, peerId);
   const [input, setInput] = useState('');
   const [copied, setCopied] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
@@ -744,6 +744,17 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
                 </span>
               )
             )}
+            {activePeers.length > 1 && (
+              transport === 'p2p' ? (
+                <span className="flex items-center gap-1 px-2 py-0.5 rounded-sm bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 border border-cyan-500/20 font-bold uppercase" title="Direct peer-to-peer data channel — the server is relaying nothing.">
+                  <Radio size={11} /> DIRECT_P2P
+                </span>
+              ) : (
+                <span className="flex items-center gap-1 px-2 py-0.5 rounded-sm bg-slate-500/10 text-slate-600 dark:text-slate-400 border border-slate-500/20 font-bold uppercase" title="No full P2P mesh — messages routed via the (blind) WS relay.">
+                  <Server size={11} /> VIA_RELAY
+                </span>
+              )
+            )}
             <div className="flex gap-2 overflow-x-auto custom-scrollbar no-scrollbar ml-2">
               {activePeers.map(p => (
                 <span key={p} className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full ${p === peerId ? 'bg-cyan-500/20 text-cyan-600 dark:text-cyan-400 border border-cyan-500/30' : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700'}`}>
@@ -752,6 +763,17 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
                     <span className="text-emerald-600 dark:text-emerald-400 cursor-help" title={`Safety number (compare out of band to verify no relay MITM):\n${safetyNumbers[p]}`}>
                       <Fingerprint size={11} />
                     </span>
+                  )}
+                  {p !== peerId && (
+                    p2pPeers.includes(p) ? (
+                      <span className="text-cyan-600 dark:text-cyan-400 cursor-help" title="Direct P2P data channel open with this peer.">
+                        <Radio size={11} />
+                      </span>
+                    ) : (
+                      <span className="text-slate-400 dark:text-slate-500 cursor-help" title="No direct channel — relayed via the server.">
+                        <Server size={11} />
+                      </span>
+                    )
                   )}
                   {isHost && isGroup && p !== peerId && (
                     <button onClick={() => kickPeer(p)} className="hover:text-red-500 transition-colors ml-0.5" title="Kick user">

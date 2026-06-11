@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { RelayEnvelope, EnvelopeType } from './shared/contracts/v1/envelope';
 import { PeerChannels, NoiseFrame } from './crypto/peer-channels';
+import { WebRTCMesh, RtcFrame, shouldUseP2P } from './transport/webrtc-mesh';
 
 export interface LocalMessage extends RelayEnvelope {
   status: 'sending' | 'sent' | 'delivered' | 'seen';
@@ -22,8 +23,10 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   const [typingAt, setTypingAt] = useState<Record<string, number>>({});
   const [secured, setSecured] = useState(false);
   const [safetyNumbers, setSafetyNumbers] = useState<Record<string, string>>({});
+  const [p2pPeers, setP2pPeers] = useState<string[]>([]);
   const socketRef = useRef<WebSocket | null>(null);
   const channelsRef = useRef<PeerChannels | null>(null);
+  const meshRef = useRef<WebRTCMesh | null>(null);
   const activePeersRef = useRef<string[]>([]);
   const readSentRef = useRef<Set<string>>(new Set());
   const pingTimestampRef = useRef<Map<string, number>>(new Map());
@@ -70,6 +73,21 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     });
   }, [sessionId, peerId, sendRaw]);
 
+  // Routes an envelope over the direct mesh when every peer has an open data
+  // channel; otherwise over the WS relay. All-or-nothing per message keeps the
+  // server out of the loop entirely once P2P is established, without risking
+  // duplicate delivery in mixed mode.
+  const dispatch = useCallback((env: RelayEnvelope) => {
+    const mesh = meshRef.current;
+    const others = activePeersRef.current.filter(id => id !== peerId);
+    if (mesh && shouldUseP2P(others, id => mesh.isConnected(id))) {
+      const data = JSON.stringify(env);
+      for (const id of others) mesh.send(id, data);
+    } else {
+      sendRaw(env);
+    }
+  }, [peerId, sendRaw]);
+
   const connect = useCallback(() => {
     if (!sessionId || !peerId) return;
 
@@ -89,6 +107,114 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       setSafetyNumbers(mgr.safetyNumbers());
       setSecured(mgr.allReady(activePeersRef.current));
     };
+
+    const refreshTransport = () => {
+      setP2pPeers(meshRef.current?.connectedPeers() ?? []);
+    };
+
+    // Transport-agnostic: invoked for envelopes arriving over the WS relay AND
+    // over direct data channels.
+    const handleEnvelope = (env: RelayEnvelope) => {
+      if (env.type === EnvelopeType.PONG) {
+        const sentAt = pingTimestampRef.current.get(env.nonce);
+        if (sentAt !== undefined) {
+          setLatencyMs(Date.now() - sentAt);
+          pingTimestampRef.current.delete(env.nonce);
+        }
+        return;
+      }
+
+      if (env.type === EnvelopeType.ACK) {
+        setMessages(prev => prev.map(m => {
+          if (m.nonce === env.payload) {
+            const deliveredTo = Array.from(new Set([...m.deliveredTo, env.from]));
+            return { ...m, deliveredTo, status: m.status === 'seen' ? 'seen' : 'delivered' };
+          }
+          return m;
+        }));
+        return;
+      }
+
+      if (env.type === EnvelopeType.READ) {
+        setMessages(prev => prev.map(m => {
+          if (m.nonce === env.payload) {
+            const seenBy = Array.from(new Set([...m.seenBy, env.from]));
+            return { ...m, seenBy, status: 'seen' };
+          }
+          return m;
+        }));
+        return;
+      }
+
+      // SIGNALING payloads are client-interpreted control frames; the server
+      // forwards them opaquely and never inspects the contents.
+      if (env.type === EnvelopeType.SIGNALING) {
+        try {
+          const sig = JSON.parse(env.payload);
+          if (sig.kind === 'noise') {
+            channelsRef.current?.onSignal(env.from, sig as NoiseFrame);
+            refreshCrypto();
+          } else if (sig.kind === 'rtc') {
+            void meshRef.current?.onSignal(env.from, sig as RtcFrame);
+            refreshTransport();
+          } else if (sig.kind === 'typing') {
+            setTypingAt(prev => {
+              if (sig.state) return { ...prev, [env.from]: Date.now() };
+              const { [env.from]: _removed, ...rest } = prev;
+              return rest;
+            });
+          } else if (sig.kind === 'alias' && typeof sig.alias === 'string' && sig.alias.trim()) {
+            const alias = sig.alias.trim().slice(0, 32);
+            setPeerAliases(prev => (prev[env.from] === alias ? prev : { ...prev, [env.from]: alias }));
+          }
+        } catch {
+          // Ignore malformed signaling frames
+        }
+        return;
+      }
+
+      if (env.type === EnvelopeType.PLAINTEXT || env.type === EnvelopeType.NOISE_MESSAGE) {
+        let text: string | null = env.payload;
+        if (env.type === EnvelopeType.NOISE_MESSAGE) {
+          const mgr = channelsRef.current;
+          try {
+            text = mgr ? mgr.decryptFrom(env.from, JSON.parse(env.payload)) : null;
+          } catch {
+            text = null;
+          }
+          // Not addressed to us, or no established channel yet — drop silently.
+          if (text === null) return;
+        }
+
+        setMessages(prev => {
+          if (prev.some(m => m.nonce === env.nonce)) return prev; // Deduplicate
+          return [...prev, { ...env, payload: text as string, status: 'delivered', deliveredTo: [], seenBy: [] }];
+        });
+
+        // Auto-reply with ACK over whichever transport is active.
+        dispatch({
+          sessionId: env.sessionId,
+          from: peerId,
+          type: EnvelopeType.ACK,
+          timestamp: Date.now(),
+          nonce: Math.random().toString(36).substring(7),
+          payload: env.nonce,
+        });
+      }
+    };
+
+    meshRef.current = new WebRTCMesh({
+      selfId: peerId,
+      sendRtc: (to: string, frame: RtcFrame) => sendSignal({ ...frame }),
+      onMessage: (_from: string, data: string) => {
+        try {
+          handleEnvelope(JSON.parse(data) as RelayEnvelope);
+        } catch {
+          // Ignore malformed data-channel frames.
+        }
+      },
+      onStateChange: refreshTransport,
+    });
 
     socket.onopen = () => {
       console.log('WS Connected');
@@ -131,11 +257,19 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
         setActivePeers(next);
         setIsGroup(!!data.isGroup);
         const mgr = channelsRef.current;
-        if (mgr) {
-          for (const id of next) if (id !== peerId) mgr.ensureChannel(id);
-          for (const id of prev) if (!next.includes(id)) mgr.removePeer(id);
-          refreshCrypto();
+        const mesh = meshRef.current;
+        for (const id of next) {
+          if (id === peerId) continue;
+          mgr?.ensureChannel(id);
+          mesh?.ensurePeer(id);
         }
+        for (const id of prev) {
+          if (next.includes(id)) continue;
+          mgr?.removePeer(id);
+          mesh?.removePeer(id);
+        }
+        refreshCrypto();
+        refreshTransport();
         return;
       }
 
@@ -152,93 +286,8 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
         return;
       }
 
-      // It's a relay envelope
-      const env = data as RelayEnvelope;
-
-      if (env.type === EnvelopeType.PONG) {
-        const sentAt = pingTimestampRef.current.get(env.nonce);
-        if (sentAt !== undefined) {
-          setLatencyMs(Date.now() - sentAt);
-          pingTimestampRef.current.delete(env.nonce);
-        }
-        return;
-      }
-
-      if (env.type === EnvelopeType.ACK) {
-        setMessages(prev => prev.map(m => {
-          if (m.nonce === env.payload) {
-            const deliveredTo = Array.from(new Set([...m.deliveredTo, env.from]));
-            return { ...m, deliveredTo, status: m.status === 'seen' ? 'seen' : 'delivered' };
-          }
-          return m;
-        }));
-        return;
-      }
-
-      if (env.type === EnvelopeType.READ) {
-        setMessages(prev => prev.map(m => {
-          if (m.nonce === env.payload) {
-            const seenBy = Array.from(new Set([...m.seenBy, env.from]));
-            return { ...m, seenBy, status: 'seen' };
-          }
-          return m;
-        }));
-        return;
-      }
-
-      // SIGNALING payloads are client-interpreted control frames (typing/alias);
-      // the server forwards them opaquely and never inspects the contents.
-      if (env.type === EnvelopeType.SIGNALING) {
-        try {
-          const sig = JSON.parse(env.payload);
-          if (sig.kind === 'noise') {
-            channelsRef.current?.onSignal(env.from, sig as NoiseFrame);
-            refreshCrypto();
-          } else if (sig.kind === 'typing') {
-            setTypingAt(prev => {
-              if (sig.state) return { ...prev, [env.from]: Date.now() };
-              const { [env.from]: _removed, ...rest } = prev;
-              return rest;
-            });
-          } else if (sig.kind === 'alias' && typeof sig.alias === 'string' && sig.alias.trim()) {
-            const alias = sig.alias.trim().slice(0, 32);
-            setPeerAliases(prev => (prev[env.from] === alias ? prev : { ...prev, [env.from]: alias }));
-          }
-        } catch {
-          // Ignore malformed signaling frames
-        }
-        return;
-      }
-
-      // Handle normal message
-      if (env.type === EnvelopeType.PLAINTEXT || env.type === EnvelopeType.NOISE_MESSAGE) {
-        let text: string | null = env.payload;
-        if (env.type === EnvelopeType.NOISE_MESSAGE) {
-          const mgr = channelsRef.current;
-          try {
-            text = mgr ? mgr.decryptFrom(env.from, JSON.parse(env.payload)) : null;
-          } catch {
-            text = null;
-          }
-          // Not addressed to us, or no established channel yet — drop silently.
-          if (text === null) return;
-        }
-
-        setMessages(prev => {
-          if (prev.some(m => m.nonce === env.nonce)) return prev; // Deduplicate
-          return [...prev, { ...env, payload: text as string, status: 'delivered', deliveredTo: [], seenBy: [] }];
-        });
-
-        // Auto-reply with ACK
-        sendRaw({
-          sessionId,
-          from: peerId,
-          type: EnvelopeType.ACK,
-          timestamp: Date.now(),
-          nonce: Math.random().toString(36).substring(7),
-          payload: env.nonce,
-        });
-      }
+      // Any other message is a relayed envelope.
+      handleEnvelope(data as RelayEnvelope);
     };
 
     socket.onclose = () => {
@@ -252,7 +301,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     };
 
     socketRef.current = socket;
-  }, [sessionId, peerId, sendRaw, sendSignal]);
+  }, [sessionId, peerId, sendRaw, sendSignal, dispatch]);
 
   const sendMessage = useCallback((payload: string, type: EnvelopeType = EnvelopeType.NOISE_MESSAGE) => {
     if (!socketRef.current || !isConnected || !sessionId || !peerId || activePeers.length <= 1) return;
@@ -271,7 +320,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       payload: wirePayload,
     };
 
-    sendRaw(wireEnvelope);
+    dispatch(wireEnvelope);
 
     if (typingStopRef.current) {
       clearTimeout(typingStopRef.current);
@@ -290,7 +339,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       deliveredTo: [],
       seenBy: []
     }]);
-  }, [isConnected, sessionId, peerId, activePeers.length, sendRaw, sendSignal]);
+  }, [isConnected, sessionId, peerId, activePeers.length, dispatch, sendSignal]);
 
   const sendTyping = useCallback(() => {
     if (activePeers.length <= 1) return;
@@ -310,8 +359,8 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   const markAsRead = useCallback((nonce: string) => {
     if (!sessionId || !peerId || readSentRef.current.has(nonce)) return;
     readSentRef.current.add(nonce);
-    
-    sendRaw({
+
+    dispatch({
       sessionId,
       from: peerId,
       type: EnvelopeType.READ,
@@ -319,7 +368,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       nonce: Math.random().toString(36).substring(7),
       payload: nonce,
     });
-  }, [sessionId, peerId, sendRaw]);
+  }, [sessionId, peerId, dispatch]);
 
   useEffect(() => {
     if (sessionId && peerId) {
@@ -327,6 +376,8 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     }
     return () => {
       socketRef.current?.close();
+      meshRef.current?.reset();
+      meshRef.current = null;
     };
   }, [sessionId, peerId, connect]);
 
@@ -388,6 +439,9 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   }, []);
 
   const typingPeers = Object.keys(typingAt).filter(id => id !== peerId);
+  const otherPeers = activePeers.filter(id => id !== peerId);
+  const transport: 'p2p' | 'relayed' =
+    otherPeers.length > 0 && otherPeers.every(id => p2pPeers.includes(id)) ? 'p2p' : 'relayed';
 
-  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers };
+  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, p2pPeers, transport };
 }
