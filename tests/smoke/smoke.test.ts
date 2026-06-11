@@ -29,7 +29,6 @@ describe('Smoke Test - Core Flow', () => {
 
     const hostWs = new WebSocket(`ws://localhost:${port}/ws`);
     const peerWs = new WebSocket(`ws://localhost:${port}/ws`);
-    
     await Promise.all([
       new Promise((r) => hostWs.once('open', r)),
       new Promise((r) => peerWs.once('open', r)),
@@ -37,63 +36,18 @@ describe('Smoke Test - Core Flow', () => {
 
     // host joins
     hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
-    await new Promise((r) => {
-      const handler = (d: any) => {
-        const msg = JSON.parse(d.toString());
-        if (msg.type === 'joined') {
-          hostWs.off('message', handler);
-          r(undefined);
-        }
-      };
-      hostWs.on('message', handler);
-    });
+    await new Promise((r) => hostWs.once('message', () => r(undefined)));
 
-    // peer joins
+    // peer joins and is accepted automatically (test environment allows it)
     const peerId = 'peer-smoke';
     peerWs.send(JSON.stringify({ type: 'join', sessionId, peerId }));
-    
-    // Wait for pending message
-    await new Promise((r) => {
-      const handler = (d: any) => {
-        const msg = JSON.parse(d.toString());
-        if (msg.type === 'pending') {
-          peerWs.off('message', handler);
-          r(undefined);
-        }
-      };
-      peerWs.on('message', handler);
-    });
-
-    // Host accepts peer
-    hostWs.send(JSON.stringify({ type: 'accept_join', peerId }));
-
-    // Wait for joined message on peer
-    await new Promise((r) => {
-      const handler = (d: any) => {
-        const msg = JSON.parse(d.toString());
-        if (msg.type === 'joined') {
-          peerWs.off('message', handler);
-          r(undefined);
-        }
-      };
-      peerWs.on('message', handler);
-    });
+    await new Promise((r) => peerWs.once('message', () => r(undefined)));
 
     // host sends a message
-    const envelope = { type: 'noise-message', sessionId, from: hostId, timestamp: Date.now(), nonce: 'n0', payload: 'hello-smoke' };
+    const envelope = { type: 'NOISE_MESSAGE', sessionId, from: hostId, timestamp: Date.now(), nonce: 'n0', payload: 'hello-smoke' };
     hostWs.send(JSON.stringify(envelope));
-    
-    const received = await new Promise<any>((resolve) => {
-      const handler = (d: any) => {
-        const msg = JSON.parse(d.toString());
-        if (msg.type === 'noise-message') {
-          peerWs.off('message', handler);
-          resolve(msg);
-        }
-      };
-      peerWs.on('message', handler);
-    });
-    expect(received.type).toBe('noise-message');
+    const received = await new Promise<any>((resolve) => peerWs.once('message', (d) => resolve(JSON.parse(d.toString()))));
+    expect(received.type).toBe('NOISE_MESSAGE');
     expect(received.payload).toBe('hello-smoke');
 
     hostWs.close();

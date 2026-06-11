@@ -107,11 +107,8 @@ export class WsTransport implements IRelayTransport {
             // Reclaiming host status
             session.hostId = peerId; // Update hostId to the new peerId if it changed
             this.connections.set(connKey, ws);
-            const wasAlreadyPeer = !!session.peers[peerId];
             session.peers[peerId] = { id: peerId, joinedAt: Date.now(), lastSeenAt: Date.now() };
-            if (!wasAlreadyPeer) {
-              session.participantCount = (session.participantCount || 0) + 1;
-            }
+            session.participantCount = (session.participantCount || 0) + 1;
             if (session.participantCount > 2) {
               session.isGroup = true;
             }
@@ -125,13 +122,10 @@ export class WsTransport implements IRelayTransport {
           }
 
           if (peerId === session.hostId || session.peers[peerId]) {
-            // Host or already accepted peer rejoining
-            const wasAlreadyPeer = !!session.peers[peerId];
+            // Host or already accepted peer joining
             this.connections.set(connKey, ws);
             session.peers[peerId] = { id: peerId, joinedAt: Date.now(), lastSeenAt: Date.now() };
-            if (!wasAlreadyPeer) {
-              session.participantCount = (session.participantCount || 0) + 1;
-            }
+            session.participantCount = (session.participantCount || 0) + 1;
             if (session.participantCount > 2) {
               session.isGroup = true;
             }
@@ -171,11 +165,8 @@ export class WsTransport implements IRelayTransport {
           const targetPeer = raw.peerId;
           if (session.pendingPeers && session.pendingPeers[targetPeer]) {
             delete session.pendingPeers[targetPeer];
-            const alreadyJoined = !!session.peers[targetPeer];
             session.peers[targetPeer] = { id: targetPeer, joinedAt: Date.now(), lastSeenAt: Date.now() };
-            if (!alreadyJoined) {
-              session.participantCount = (session.participantCount || 0) + 1;
-            }
+            session.participantCount = (session.participantCount || 0) + 1;
             if (session.participantCount > 2) {
               session.isGroup = true;
             }
@@ -270,7 +261,6 @@ export class WsTransport implements IRelayTransport {
         
         const session = await this.store.get(currentSessionId);
         if (session && session.peers[currentPeerId]) {
-          delete session.peers[currentPeerId];
           session.participantCount = Math.max(0, (session.participantCount || 1) - 1);
           if (session.participantCount === 0) {
             session.emptySince = Date.now();

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { CreateSessionResponse } from './shared/contracts/v1/session';
 
 export interface SavedSession {
@@ -23,7 +23,6 @@ export function useSession() {
     const saved = localStorage.getItem('qb-saved-sessions');
     return saved ? JSON.parse(saved) : [];
   });
-  const refreshedRef = useRef(false);
 
   useEffect(() => {
     localStorage.setItem('qb-saved-sessions', JSON.stringify(savedSessions));
@@ -125,11 +124,7 @@ export function useSession() {
   const refreshSession = useCallback(async () => {
     if (!sessionId) return;
     try {
-      const token = localStorage.getItem(`qb-recovery-${sessionId}`);
-      const resp = await fetch(`/api/sessions/${sessionId}/refresh`, {
-        method: 'POST',
-        headers: token ? { 'X-Host-Token': token } : {},
-      });
+      const resp = await fetch(`/api/sessions/${sessionId}/refresh`, { method: 'POST' });
       if (!resp.ok) throw new Error('Refresh failed');
       const data = await resp.json();
       setExpiresAt(data.expiresAt);
@@ -170,9 +165,7 @@ export function useSession() {
 
   useEffect(() => {
     if (!expiresAt) return;
-    // Reset on each new expiresAt so a fresh window gets exactly one auto-refresh.
-    refreshedRef.current = false;
-
+    
     const updateTimer = () => {
       const now = Date.now();
       const diff = expiresAt - now;
@@ -185,12 +178,9 @@ export function useSession() {
         const secs = Math.floor((diff % 60000) / 1000);
         setTimeLeft(`${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`);
         setIsExpired(false);
-
-        // Auto-refresh once when less than 2 minutes remain.
-        // Keeping refreshedRef true until expiresAt updates (on success the effect
-        // re-runs with a new expiresAt, resetting the flag above).
-        if (diff < 2 * 60 * 1000 && !refreshedRef.current) {
-          refreshedRef.current = true;
+        
+        // Auto-refresh if less than 2 minutes left
+        if (diff < 2 * 60 * 1000) {
           refreshSession();
         }
         return true;
@@ -201,7 +191,7 @@ export function useSession() {
     const interval = setInterval(() => {
       if (!updateTimer()) clearInterval(interval);
     }, 1000);
-
+    
     return () => clearInterval(interval);
   }, [expiresAt, refreshSession]);
 

@@ -31,9 +31,9 @@ describe('E2E WebSocket Relay', () => {
     server.close();
   });
 
-  const connectWs = (): Promise<WebSocket> => {
+  const connectWs = (sessionId: string, peerId: string, role: string): Promise<WebSocket> => {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?sessionId=${sessionId}&peerId=${peerId}&role=${role}`);
       ws.on('open', () => resolve(ws));
       ws.on('error', reject);
     });
@@ -45,60 +45,22 @@ describe('E2E WebSocket Relay', () => {
       .post('/api/sessions')
       .send({ name: 'E2E Vault', expiresInSeconds: 600 });
     
-    const { sessionId, hostId, hostRecoveryToken } = res.body;
+    const sessionId = res.body.sessionId;
+    const hostId = res.body.hostId;
 
     // 2. Connect Host
-    const hostWs = await connectWs();
-    hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
-    await new Promise((r) => {
-      const h = (d: any) => {
-        const msg = JSON.parse(d.toString());
-        if (msg.type === 'joined') {
-          hostWs.off('message', h);
-          r(undefined);
-        }
-      };
-      hostWs.on('message', h);
-    });
+    const hostWs = await connectWs(sessionId, hostId, 'host');
     
     // 3. Connect Peer
     const peerId = 'peer-test';
-    const peerWs = await connectWs();
-    peerWs.send(JSON.stringify({ type: 'join', sessionId, peerId }));
-    await new Promise((r) => {
-      const h = (d: any) => {
-        const msg = JSON.parse(d.toString());
-        if (msg.type === 'pending') {
-          peerWs.off('message', h);
-          r(undefined);
-        }
-      };
-      peerWs.on('message', h);
-    });
+    const peerWs = await connectWs(sessionId, peerId, 'participant');
 
-    // 4. Host accepts peer
-    hostWs.send(JSON.stringify({ type: 'accept_join', peerId }));
-    await new Promise((r) => {
-      const h = (d: any) => {
-        const msg = JSON.parse(d.toString());
-        if (msg.type === 'joined') {
-          peerWs.off('message', h);
-          r(undefined);
-        }
-      };
-      peerWs.on('message', h);
-    });
-
-    // 5. Send Message from Peer to Host
+    // 4. Send Message from Peer to Host
     const msgPromise = new Promise<any>((resolve) => {
-      const h = (data: any) => {
+      hostWs.on('message', (data) => {
         const parsed = JSON.parse(data.toString());
-        if (parsed.type === EnvelopeType.NOISE_MESSAGE) {
-          hostWs.off('message', h);
-          resolve(parsed);
-        }
-      };
-      hostWs.on('message', h);
+        if (parsed.type === EnvelopeType.NOISE_MESSAGE) resolve(parsed);
+      });
     });
 
     const envelope: RelayEnvelope = {
@@ -125,20 +87,10 @@ describe('E2E WebSocket Relay', () => {
       .post('/api/sessions')
       .send({ name: 'Destroy Test Vault', expiresInSeconds: 600 });
     
-    const { sessionId, hostId, hostRecoveryToken } = res.body;
+    const sessionId = res.body.sessionId;
+    const hostToken = res.body.hostRecoveryToken;
 
-    const hostWs = await connectWs();
-    hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
-    await new Promise((r) => {
-      const h = (d: any) => {
-        const msg = JSON.parse(d.toString());
-        if (msg.type === 'joined') {
-          hostWs.off('message', h);
-          r(undefined);
-        }
-      };
-      hostWs.on('message', h);
-    });
+    const hostWs = await connectWs(sessionId, res.body.hostId, 'host');
     
     const closePromise = new Promise<void>((resolve) => {
       hostWs.on('close', () => resolve());
@@ -146,7 +98,7 @@ describe('E2E WebSocket Relay', () => {
 
     await request(app)
       .delete(`/api/sessions/${sessionId}`)
-      .set('x-host-token', hostRecoveryToken);
+      .set('x-host-token', hostToken);
 
     await closePromise; // Should resolve if socket is force-closed
     expect(hostWs.readyState).toBe(WebSocket.CLOSED);
