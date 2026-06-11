@@ -493,7 +493,7 @@ interface ChatRoomProps {
 }
 
 function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft, isExpired, securityOptions, reset }: ChatRoomProps) {
-  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, markAsRead, acceptJoin, rejectJoin, kickPeer } = useRelay(sessionId, peerId);
+  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad } = useRelay(sessionId, peerId);
   const [input, setInput] = useState('');
   const [copied, setCopied] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -818,11 +818,21 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
           <div className="flex justify-between items-end">
             <div>
               <div className="text-[9px] text-slate-500 font-mono uppercase">IO_LOAD</div>
-              <div className="text-base font-mono text-slate-900 dark:text-white">0.02%</div>
+              <div className="text-base font-mono text-slate-900 dark:text-white">{ioLoad.toFixed(3)}%</div>
             </div>
             <div className="text-right">
               <div className="text-[9px] text-slate-500 font-mono uppercase">LATENCY</div>
-              <div className="text-base font-mono text-emerald-600 dark:text-emerald-400 tracking-tighter">3.2ms</div>
+              <div className={`text-base font-mono tracking-tighter ${
+                latencyMs === null
+                  ? 'text-slate-400 dark:text-slate-600'
+                  : latencyMs < 50
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : latencyMs < 150
+                      ? 'text-yellow-600 dark:text-yellow-400'
+                      : 'text-red-600 dark:text-red-400'
+              }`}>
+                {latencyMs === null ? '—' : `${latencyMs}ms`}
+              </div>
             </div>
           </div>
         </div>

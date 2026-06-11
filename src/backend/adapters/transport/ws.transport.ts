@@ -1,7 +1,7 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import { IncomingMessage } from 'http';
 import { IRelayTransport } from '../../application/ports/relay-transport.port';
-import { RelayEnvelope } from '../../../shared/contracts/v1/envelope';
+import { RelayEnvelope, EnvelopeType } from '../../../shared/contracts/v1/envelope';
 import { IEventBus } from '../../application/ports/event-bus.port';
 import { RelayMessage } from '../../application/use-cases/relay-message.use-case';
 import { RelayEnvelopeSchema } from '../../../shared/contracts/v1/schemas';
@@ -241,6 +241,19 @@ export class WsTransport implements IRelayTransport {
              ws.send(JSON.stringify({ type: 'error', message: 'Not authorized or pending' }));
              return;
           }
+          // Reflect PING back as PONG to sender only — not relayed to peers
+          if (raw.type === EnvelopeType.PING) {
+            ws.send(JSON.stringify({
+              sessionId: currentSessionId,
+              from: 'server',
+              type: EnvelopeType.PONG,
+              timestamp: Date.now(),
+              nonce: raw.nonce,
+              payload: '',
+            }));
+            return;
+          }
+
           const result = RelayEnvelopeSchema.safeParse(raw);
           if (result.success) {
             await this.relayMessage.execute(result.data);
