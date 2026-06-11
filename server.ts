@@ -74,14 +74,18 @@ export async function setupApp() {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    // Extend session by another 15 mins (or whatever the default is), up to max TTL
+    const hostToken = req.headers['x-host-token'];
+    if (session.hostRecoveryToken !== hostToken) {
+      return res.status(403).json({ error: 'Only the host can refresh the session' });
+    }
+
     const extension = 15 * 60 * 1000;
     const newExpiresAt = Math.min(Date.now() + extension, session.createdAt + 24 * 60 * 60 * 1000);
     session.expiresAt = newExpiresAt;
     session.lastActivityAt = Date.now();
-    
+
     await container.store.save(session);
-    
+
     res.json({
       sessionId: session.id,
       expiresAt: session.expiresAt
@@ -104,14 +108,14 @@ export async function setupApp() {
     res.status(204).send();
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== 'production') {
+  // Vite middleware for development (skip in test environments)
+  if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (process.env.NODE_ENV === 'production') {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
@@ -129,7 +133,9 @@ async function startServer() {
   });
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
+  startServer().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
