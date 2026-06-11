@@ -107,8 +107,11 @@ export class WsTransport implements IRelayTransport {
             // Reclaiming host status
             session.hostId = peerId; // Update hostId to the new peerId if it changed
             this.connections.set(connKey, ws);
+            const wasAlreadyPeer = !!session.peers[peerId];
             session.peers[peerId] = { id: peerId, joinedAt: Date.now(), lastSeenAt: Date.now() };
-            session.participantCount = (session.participantCount || 0) + 1;
+            if (!wasAlreadyPeer) {
+              session.participantCount = (session.participantCount || 0) + 1;
+            }
             if (session.participantCount > 2) {
               session.isGroup = true;
             }
@@ -122,10 +125,13 @@ export class WsTransport implements IRelayTransport {
           }
 
           if (peerId === session.hostId || session.peers[peerId]) {
-            // Host or already accepted peer joining
+            // Host or already accepted peer rejoining
+            const wasAlreadyPeer = !!session.peers[peerId];
             this.connections.set(connKey, ws);
             session.peers[peerId] = { id: peerId, joinedAt: Date.now(), lastSeenAt: Date.now() };
-            session.participantCount = (session.participantCount || 0) + 1;
+            if (!wasAlreadyPeer) {
+              session.participantCount = (session.participantCount || 0) + 1;
+            }
             if (session.participantCount > 2) {
               session.isGroup = true;
             }

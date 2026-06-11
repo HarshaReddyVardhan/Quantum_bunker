@@ -74,14 +74,18 @@ export async function setupApp() {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    // Extend session by another 15 mins (or whatever the default is), up to max TTL
+    const hostToken = req.headers['x-host-token'];
+    if (session.hostRecoveryToken !== hostToken) {
+      return res.status(403).json({ error: 'Only the host can refresh the session' });
+    }
+
     const extension = 15 * 60 * 1000;
     const newExpiresAt = Math.min(Date.now() + extension, session.createdAt + 24 * 60 * 60 * 1000);
     session.expiresAt = newExpiresAt;
     session.lastActivityAt = Date.now();
-    
+
     await container.store.save(session);
-    
+
     res.json({
       sessionId: session.id,
       expiresAt: session.expiresAt
