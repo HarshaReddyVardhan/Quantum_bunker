@@ -31,8 +31,8 @@ describe('PeerChannels', () => {
     expect(m['peer-b'].isReady('peer-a')).toBe(true);
 
     const payload = m['peer-a'].encryptForAll('hello bob');
-    expect(payload.c['peer-b']).toBeTypeOf('string');
-    expect(payload.c['peer-b']).not.toContain('hello');
+    expect(payload.c['peer-b']).toMatchObject({ h: expect.any(Object), ct: expect.any(String) });
+    expect(payload.c['peer-b'].ct).not.toContain('hello');
     expect(m['peer-b'].decryptFrom('peer-a', payload)).toBe('hello bob');
 
     const reply = m['peer-b'].encryptForAll('hi alice');
@@ -78,7 +78,39 @@ describe('PeerChannels', () => {
     const m = mesh('peer-a', 'peer-b');
     connect(m);
     expect(m['peer-a'].decryptFrom('peer-unknown', { c: {} })).toBeNull();
-    expect(m['peer-b'].decryptFrom('peer-a', { c: { 'peer-other': 'x' } })).toBeNull();
+    expect(m['peer-b'].decryptFrom('peer-a', { c: { 'peer-other': { h: { dh: 'x', n: 0, pn: 0 }, ct: 'x' } } })).toBeNull();
+  });
+
+  it('handles out-of-order delivery via skipped message keys', () => {
+    const m = mesh('peer-a', 'peer-b');
+    connect(m);
+    const p1 = m['peer-a'].encryptForAll('first');
+    const p2 = m['peer-a'].encryptForAll('second');
+    const p3 = m['peer-a'].encryptForAll('third');
+    // Deliver out of order: 2, 1, 3
+    expect(m['peer-b'].decryptFrom('peer-a', p2)).toBe('second');
+    expect(m['peer-b'].decryptFrom('peer-a', p1)).toBe('first');
+    expect(m['peer-b'].decryptFrom('peer-a', p3)).toBe('third');
+  });
+
+  it('each message uses a unique ciphertext (per-message key)', () => {
+    const m = mesh('peer-a', 'peer-b');
+    connect(m);
+    const p1 = m['peer-a'].encryptForAll('hello');
+    const p2 = m['peer-a'].encryptForAll('hello');
+    // Same plaintext → different ciphertexts (ratchet produces different keys)
+    expect(p1.c['peer-b'].ct).not.toBe(p2.c['peer-b'].ct);
+  });
+
+  it('returns matching fingerprints for each peer', () => {
+    const m = mesh('peer-a', 'peer-b');
+    connect(m);
+    const fpFromA = m['peer-a'].fingerprints()['peer-b'];
+    const fpFromB = m['peer-b'].fingerprints()['peer-a'];
+    // A's view of B's fingerprint should equal B's own fingerprint, and vice versa
+    expect(fpFromA).toBe(m['peer-b'].ownFingerprint());
+    expect(fpFromB).toBe(m['peer-a'].ownFingerprint());
+    expect(fpFromA).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('drops a removed peer', () => {

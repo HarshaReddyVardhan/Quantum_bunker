@@ -71,6 +71,10 @@ export class HandshakeState {
     return this.sym.handshakeHash;
   }
 
+  get chainKey(): Uint8Array {
+    return this.sym.chainKey;
+  }
+
   transport(): Transport {
     if (!this.cipherPair) throw new Error('NOISE_HANDSHAKE_INCOMPLETE');
     const [c1, c2] = this.cipherPair;
