@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Lock, Send, Plus, LogIn, Copy, Check, Info, Trash2, ShieldCheck, Activity, Terminal, Sun, Moon, Menu, X } from 'lucide-react';
+import { Lock, Send, Plus, LogIn, Copy, Check, Info, Trash2, ShieldCheck, Activity, Terminal, Sun, Moon, Menu, X, Share2, QrCode } from 'lucide-react';
+import QRCode from 'qrcode';
 import { useRelay } from './useRelay';
 import { useSession } from './useSession';
 
@@ -77,6 +78,14 @@ export default function App() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
+  }, []);
+
+  useEffect(() => {
+    const vault = new URLSearchParams(window.location.search).get('vault');
+    if (vault) {
+      setJoinId(vault.trim());
+      window.history.replaceState({}, '', window.location.pathname);
+    }
   }, []);
 
   const toggleTheme = () => setTheme(prev => prev === 'light' ? 'dark' : 'light');
@@ -493,13 +502,25 @@ interface ChatRoomProps {
 }
 
 function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft, isExpired, securityOptions, reset }: ChatRoomProps) {
-  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad } = useRelay(sessionId, peerId);
+  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers } = useRelay(sessionId, peerId);
   const [input, setInput] = useState('');
   const [copied, setCopied] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const [logs, setLogs] = useState<{ t: string; msg: string; color: string }[]>([]);
   const [showLeftSidebar, setShowLeftSidebar] = useState(false);
   const [showRightSidebar, setShowRightSidebar] = useState(false);
+
+  const shareLink = `${window.location.origin}/?vault=${sessionId}`;
+
+  const displayName = (id: string) => peerAliases[id] || id.replace('peer-', 'PEER_');
+
+  useEffect(() => {
+    QRCode.toDataURL(shareLink, { margin: 1, width: 240, color: { dark: '#0a0a0a', light: '#ffffff' } })
+      .then(setQrDataUrl)
+      .catch(() => setQrDataUrl(''));
+  }, [shareLink]);
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -531,6 +552,12 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
     navigator.clipboard.writeText(sessionId);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const copyShareLink = () => {
+    navigator.clipboard.writeText(shareLink);
+    setLinkCopied(true);
+    setTimeout(() => setLinkCopied(false), 2000);
   };
 
   return (
@@ -593,6 +620,28 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
                 </span>
               </div>
             )}
+          </div>
+        </section>
+
+        <section>
+          <h3 className="mono-label mb-4 uppercase tracking-widest font-bold flex items-center gap-2">
+            <QrCode size={12} /> Share Vault
+          </h3>
+          <div className="space-y-3">
+            {qrDataUrl && (
+              <div className="p-3 bg-white border border-black/5 dark:border-white/10 flex items-center justify-center">
+                <img src={qrDataUrl} alt="Vault join QR code" className="w-full max-w-[180px] aspect-square" />
+              </div>
+            )}
+            <button
+              onClick={copyShareLink}
+              className="w-full flex items-center justify-center gap-2 px-3 py-2 border border-cyan-500/30 bg-cyan-500/5 hover:bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 text-[10px] font-mono uppercase tracking-widest transition-colors"
+            >
+              {linkCopied ? <><Check size={12} /> Link_Copied</> : <><Share2 size={12} /> Copy_Share_Link</>}
+            </button>
+            <p className="text-[9px] font-mono text-slate-500 italic uppercase tracking-tighter leading-relaxed text-center">
+              Scan or share to auto-fill the vault hash
+            </p>
           </div>
         </section>
 
@@ -687,7 +736,7 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
             <div className="flex gap-2 overflow-x-auto custom-scrollbar no-scrollbar ml-2">
               {activePeers.map(p => (
                 <span key={p} className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full ${p === peerId ? 'bg-cyan-500/20 text-cyan-600 dark:text-cyan-400 border border-cyan-500/30' : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700'}`}>
-                  {p.replace('peer-', '')} {p === peerId ? '(You)' : ''}
+                  {p === peerId ? `${displayName(p)} (You)` : displayName(p)}
                   {isHost && isGroup && p !== peerId && (
                     <button onClick={() => kickPeer(p)} className="hover:text-red-500 transition-colors ml-0.5" title="Kick user">
                       ✕
@@ -741,7 +790,7 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
                   <div className="flex items-center gap-2 mb-1.5 px-1 text-ui-muted dark:text-slate-600">
                     {!isMe && <span className={`w-1.5 h-1.5 ${dotColor}`}></span>}
                     <span className={`text-[10px] font-mono ${headColor} uppercase font-bold tracking-tighter`}>
-                      {msg.from.replace('peer-', 'PEER_')}
+                      {displayName(msg.from)}
                     </span>
                     <span className="text-[9px] font-mono italic">
                       {new Date(msg.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 } as any)}
@@ -768,14 +817,34 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
           <div ref={scrollRef} />
         </div>
 
+        <AnimatePresence>
+          {typingPeers.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 4 }}
+              className="px-6 py-1.5 flex items-center gap-2 text-[10px] font-mono text-cyan-600 dark:text-cyan-400 shrink-0"
+            >
+              <span className="flex gap-0.5">
+                <span className="w-1 h-1 rounded-full bg-cyan-500 animate-bounce [animation-delay:-0.3s]"></span>
+                <span className="w-1 h-1 rounded-full bg-cyan-500 animate-bounce [animation-delay:-0.15s]"></span>
+                <span className="w-1 h-1 rounded-full bg-cyan-500 animate-bounce"></span>
+              </span>
+              <span className="uppercase tracking-tighter italic truncate">
+                {typingPeers.map(displayName).join(', ')} {typingPeers.length > 1 ? 'are' : 'is'} typing...
+              </span>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         <div className="h-20 border-t border-black/5 dark:border-white/5 p-4 shrink-0 bg-ui-elevated dark:bg-brand-elevated">
           <form onSubmit={handleSend} className="h-full flex gap-4 max-w-5xl mx-auto">
             <div className="flex-1 bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 focus-within:border-cyan-500/50 transition-colors flex items-center px-4 font-mono text-sm group">
               <span className="text-cyan-600 dark:text-cyan-500 mr-3 select-none">$</span>
-              <input 
-                type="text" 
+              <input
+                type="text"
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={(e) => { setInput(e.target.value); sendTyping(); }}
                 placeholder="Type encrypted payload..."
                 className="flex-1 bg-transparent border-none outline-none text-slate-700 dark:text-slate-300 placeholder:text-slate-400 dark:placeholder:text-slate-700"
                 autoComplete="off"
