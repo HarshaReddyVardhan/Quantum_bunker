@@ -1,101 +1,129 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { WebSocket } from 'ws';
+import request from 'supertest';
 import { setupApp } from '../../server';
 import { Application } from 'express';
-import { Worker } from 'worker_threads';
 
-/**
- * Load test: Simulate a large number of concurrent connections and messages.
- * Uses Node worker threads to parallelize connection handling.
- */
+const SESSION_COUNT = 150;
+const GUESTS_PER_SESSION = 8; // guests per session (host + 8 guests = 9 total, within MAX_PEERS=10)
+const TOTAL_CONNECTIONS = SESSION_COUNT * (1 + GUESTS_PER_SESSION); // 150 * 9 = 1350
 
-describe('Load Test - High Volume Messaging', () => {
+describe('Load Test - Concurrent Sessions', () => {
   let app: Application;
   let server: any;
   let port: number;
-  const totalPeers = 200; // total concurrent peers
-  const workers = 4; // number of worker threads
-  const peersPerWorker = Math.ceil(totalPeers / workers);
+  let cleanupInterval: ReturnType<typeof setInterval>;
 
   beforeAll(async () => {
     const setup = await setupApp();
     app = setup.app;
     server = setup.server;
+    cleanupInterval = setup.cleanupInterval;
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', () => {
-        port = server.address().port;
+        port = (server.address() as { port: number }).port;
         resolve();
       });
     });
   });
 
   afterAll(() => {
+    clearInterval(cleanupInterval);
     server.close();
   });
 
-  it('handles high volume of peers and messages', async () => {
-    // create session
-    const res = await (await import('supertest')).default(app)
-      .post('/api/sessions')
-      .send({ name: 'Load', expiresInSeconds: 600 });
-    expect(res.status).toBe(201);
-    const { sessionId, hostRecoveryToken, hostId } = res.body;
+  function openWs(): Promise<WebSocket> {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      ws.once('open', () => resolve(ws));
+      ws.once('error', reject);
+    });
+  }
 
-    // host joins
-    const hostWs = new WebSocket(`ws://localhost:${port}/ws`);
-    await new Promise((r) => hostWs.once('open', r));
-    hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
-    await new Promise((r) => hostWs.once('message', () => r(undefined)));
-
-    // function to run in worker
-    const workerCode = `
-      const { parentPort, workerData, threadId } = require('worker_threads');
-      const WebSocket = require('ws');
-      const peers = [];
-      const { sessionId, port, count } = workerData;
-      (async () => {
-        for (let i = 0; i < count; i++) {
-          const ws = new WebSocket(\`ws://localhost:\${port}/ws\`);
-          await new Promise(r => ws.once('open', r));
-          ws.send(JSON.stringify({ type: 'join', sessionId, peerId: 'peer-' + i + '-' + threadId }));
-          await new Promise(r => ws.once('message', () => r(undefined)));
-          peers.push(ws);
+  function nextMessage(ws: WebSocket, predicate?: (m: any) => boolean): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Timed out waiting for WS message')), 8000);
+      const handler = (data: Buffer) => {
+        const msg = JSON.parse(data.toString());
+        if (!predicate || predicate(msg)) {
+          clearTimeout(timer);
+          ws.off('message', handler);
+          resolve(msg);
         }
-        parentPort.postMessage({ ready: true });
-        // keep connections alive until main thread signals to close
-        parentPort.on('message', (msg) => {
-          if (msg === 'close') {
-            peers.forEach(p => p.close());
-            process.exit(0);
-          }
-        });
-      })();
-    `;
+      };
+      ws.on('message', handler);
+    });
+  }
 
-    // launch workers
-    const workerPromises = [];
-    for (let w = 0; w < workers; w++) {
-      const worker = new Worker(workerCode, {
-        eval: true,
-        workerData: { sessionId, port, count: peersPerWorker },
-      });
-      workerPromises.push(new Promise<void>((resolve) => {
-        worker.once('message', () => resolve());
-      }));
+  it(`handles ${SESSION_COUNT} concurrent sessions with relay verification`, async () => {
+    const allSockets: WebSocket[] = [];
+
+    const sessionMeta = await Promise.all(
+      Array.from({ length: SESSION_COUNT }, async (_, i) => {
+        const res = await request(app)
+          .post('/api/sessions')
+          .send({ name: `load-${i}`, expiresInSeconds: 600 });
+        expect(res.status).toBe(201);
+        return res.body as { sessionId: string; hostId: string; hostRecoveryToken: string };
+      })
+    );
+
+    await Promise.all(
+      sessionMeta.map(async ({ sessionId, hostId, hostRecoveryToken }) => {
+        // Host joins
+        const hostWs = await openWs();
+        allSockets.push(hostWs);
+        hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+        await nextMessage(hostWs, m => m.type === 'joined');
+
+        // Each guest connects; host auto-accepts each join_request
+        const guestSockets: WebSocket[] = [];
+        for (let g = 0; g < GUESTS_PER_SESSION; g++) {
+          const guestId = `guest-${sessionId.slice(0, 8)}-${g}`;
+          const guestWs = await openWs();
+          allSockets.push(guestWs);
+          guestSockets.push(guestWs);
+
+          guestWs.send(JSON.stringify({ type: 'join', sessionId, peerId: guestId }));
+
+          // Host receives the join_request and approves it
+          const req = await nextMessage(hostWs, m => m.type === 'join_request');
+          hostWs.send(JSON.stringify({ type: 'accept_join', peerId: req.peerId }));
+
+          // Guest confirms joined
+          const confirmation = await nextMessage(guestWs, m => m.type === 'joined');
+          expect(confirmation.sessionId).toBe(sessionId);
+        }
+
+        // Each guest waits for a relay message
+        const relayPromises = guestSockets.map(guestWs =>
+          nextMessage(guestWs, m => m.type === 'noise-message')
+        );
+
+        // Host broadcasts one message
+        const nonce = `n-${sessionId.slice(0, 8)}`;
+        hostWs.send(JSON.stringify({
+          type: 'noise-message',
+          sessionId,
+          from: hostId,
+          timestamp: Date.now(),
+          nonce,
+          payload: 'bG9hZA',
+        }));
+
+        // All guests must receive it
+        const received = await Promise.all(relayPromises);
+        for (const msg of received) {
+          expect(msg.nonce).toBe(nonce);
+          expect(msg.from).toBe(hostId);
+        }
+      })
+    );
+
+    for (const ws of allSockets) {
+      ws.close();
     }
-    // wait for workers ready
-    await Promise.all(workerPromises);
 
-    // host sends a broadcast message
-    const envelope = { type: 'NOISE_MESSAGE', sessionId, from: hostId, timestamp: Date.now(), nonce: 'load-n0', payload: 'load-test' };
-    hostWs.send(JSON.stringify(envelope));
-
-    // simple validation: just ensure no errors on host side
-    // cleanup workers
-    // (In a real load test we would verify all peers receive the message, but that would be heavy for CI)
-    // close workers
-    // Not implementing explicit close due to limitation of worker communication in this env.
-
-    hostWs.close();
-  }, 300000); // extended timeout for load test
+    expect(allSockets).toHaveLength(TOTAL_CONNECTIONS);
+  }, 120000);
 });

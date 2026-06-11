@@ -5,6 +5,9 @@ export default defineConfig({
     environment: 'node',
     globals: true,
     setupFiles: ['./vitest.setup.ts'],
+    env: {
+      RELAY_CONN_PER_IP_LIMIT: '2000',
+    },
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],

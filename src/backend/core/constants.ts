@@ -9,7 +9,7 @@ export const RELAY_LIMITS = {
   MAX_PAYLOAD_BYTES: 1024 * 1024, // 1MB
   TIMESTAMP_TOLERANCE_MS: 60 * 1000, // 1 minute drift allowed
   MSG_PER_SECOND_LIMIT: 10,
-  CONN_PER_IP_LIMIT: 50,
+  CONN_PER_IP_LIMIT: parseInt(process.env.RELAY_CONN_PER_IP_LIMIT || '50', 10),
   CONN_WINDOW_MS: 60 * 1000, // 1 minute
 };
 
