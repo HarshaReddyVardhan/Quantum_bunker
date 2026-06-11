@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { RelayEnvelope, EnvelopeType } from './shared/contracts/v1/envelope';
+import { PeerChannels, NoiseFrame } from './crypto/peer-channels';
 
 export interface LocalMessage extends RelayEnvelope {
   status: 'sending' | 'sent' | 'delivered' | 'seen';
@@ -19,7 +20,11 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   const [ioLoad, setIoLoad] = useState<number>(0);
   const [peerAliases, setPeerAliases] = useState<Record<string, string>>({});
   const [typingAt, setTypingAt] = useState<Record<string, number>>({});
+  const [secured, setSecured] = useState(false);
+  const [safetyNumbers, setSafetyNumbers] = useState<Record<string, string>>({});
   const socketRef = useRef<WebSocket | null>(null);
+  const channelsRef = useRef<PeerChannels | null>(null);
+  const activePeersRef = useRef<string[]>([]);
   const readSentRef = useRef<Set<string>>(new Set());
   const pingTimestampRef = useRef<Map<string, number>>(new Map());
   const bytesInWindowRef = useRef<number>(0);
@@ -72,14 +77,27 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     const wsUrl = `${protocol}//${window.location.host}/ws`;
     const socket = new WebSocket(wsUrl);
 
+    channelsRef.current = new PeerChannels({
+      sessionId,
+      selfId: peerId,
+      sendNoise: (to: string, frame: NoiseFrame) => sendSignal({ ...frame }),
+    });
+
+    const refreshCrypto = () => {
+      const mgr = channelsRef.current;
+      if (!mgr) return;
+      setSafetyNumbers(mgr.safetyNumbers());
+      setSecured(mgr.allReady(activePeersRef.current));
+    };
+
     socket.onopen = () => {
       console.log('WS Connected');
       const msg = localStorage.getItem('qb-join-msg') || 'Hello';
       const recoveryToken = localStorage.getItem(`qb-recovery-${sessionId}`);
-      socket.send(JSON.stringify({ 
-        type: 'join', 
-        sessionId, 
-        peerId, 
+      socket.send(JSON.stringify({
+        type: 'join',
+        sessionId,
+        peerId,
         message: msg,
         hostRecoveryToken: recoveryToken
       }));
@@ -107,8 +125,17 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       }
 
       if (data.type === 'peer_update') {
-        setActivePeers(data.peers);
+        const prev = activePeersRef.current;
+        const next = data.peers as string[];
+        activePeersRef.current = next;
+        setActivePeers(next);
         setIsGroup(!!data.isGroup);
+        const mgr = channelsRef.current;
+        if (mgr) {
+          for (const id of next) if (id !== peerId) mgr.ensureChannel(id);
+          for (const id of prev) if (!next.includes(id)) mgr.removePeer(id);
+          refreshCrypto();
+        }
         return;
       }
 
@@ -164,7 +191,10 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       if (env.type === EnvelopeType.SIGNALING) {
         try {
           const sig = JSON.parse(env.payload);
-          if (sig.kind === 'typing') {
+          if (sig.kind === 'noise') {
+            channelsRef.current?.onSignal(env.from, sig as NoiseFrame);
+            refreshCrypto();
+          } else if (sig.kind === 'typing') {
             setTypingAt(prev => {
               if (sig.state) return { ...prev, [env.from]: Date.now() };
               const { [env.from]: _removed, ...rest } = prev;
@@ -182,11 +212,23 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
 
       // Handle normal message
       if (env.type === EnvelopeType.PLAINTEXT || env.type === EnvelopeType.NOISE_MESSAGE) {
+        let text: string | null = env.payload;
+        if (env.type === EnvelopeType.NOISE_MESSAGE) {
+          const mgr = channelsRef.current;
+          try {
+            text = mgr ? mgr.decryptFrom(env.from, JSON.parse(env.payload)) : null;
+          } catch {
+            text = null;
+          }
+          // Not addressed to us, or no established channel yet — drop silently.
+          if (text === null) return;
+        }
+
         setMessages(prev => {
           if (prev.some(m => m.nonce === env.nonce)) return prev; // Deduplicate
-          return [...prev, { ...env, status: 'delivered', deliveredTo: [], seenBy: [] }];
+          return [...prev, { ...env, payload: text as string, status: 'delivered', deliveredTo: [], seenBy: [] }];
         });
-        
+
         // Auto-reply with ACK
         sendRaw({
           sessionId,
@@ -210,21 +252,26 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     };
 
     socketRef.current = socket;
-  }, [sessionId, peerId, sendRaw]);
+  }, [sessionId, peerId, sendRaw, sendSignal]);
 
-  const sendMessage = useCallback((payload: string, type: EnvelopeType = EnvelopeType.PLAINTEXT) => {
+  const sendMessage = useCallback((payload: string, type: EnvelopeType = EnvelopeType.NOISE_MESSAGE) => {
     if (!socketRef.current || !isConnected || !sessionId || !peerId || activePeers.length <= 1) return;
 
-    const envelope: RelayEnvelope = {
+    const wirePayload =
+      type === EnvelopeType.NOISE_MESSAGE && channelsRef.current
+        ? JSON.stringify(channelsRef.current.encryptForAll(payload))
+        : payload;
+
+    const wireEnvelope: RelayEnvelope = {
       sessionId,
       from: peerId,
       type,
       timestamp: Date.now(),
       nonce: Math.random().toString(36).substring(7),
-      payload,
+      payload: wirePayload,
     };
 
-    sendRaw(envelope);
+    sendRaw(wireEnvelope);
 
     if (typingStopRef.current) {
       clearTimeout(typingStopRef.current);
@@ -235,8 +282,10 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       sendSignal({ kind: 'typing', state: false });
     }
 
+    // Local echo keeps the plaintext so the sender sees their own message.
     setMessages(prev => [...prev, {
-      ...envelope,
+      ...wireEnvelope,
+      payload,
       status: 'sent',
       deliveredTo: [],
       seenBy: []
@@ -340,5 +389,5 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
 
   const typingPeers = Object.keys(typingAt).filter(id => id !== peerId);
 
-  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers };
+  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers };
 }

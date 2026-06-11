@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Lock, Send, Plus, LogIn, Copy, Check, Info, Trash2, ShieldCheck, Activity, Terminal, Sun, Moon, Menu, X, Share2, QrCode } from 'lucide-react';
+import { Lock, Send, Plus, LogIn, Copy, Check, Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Activity, Terminal, Sun, Moon, Menu, X, Share2, QrCode } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useRelay } from './useRelay';
 import { useSession } from './useSession';
@@ -502,7 +502,7 @@ interface ChatRoomProps {
 }
 
 function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft, isExpired, securityOptions, reset }: ChatRoomProps) {
-  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers } = useRelay(sessionId, peerId);
+  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers } = useRelay(sessionId, peerId);
   const [input, setInput] = useState('');
   const [copied, setCopied] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
@@ -733,10 +733,26 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
           <div className="px-6 py-2 border-b border-black/5 dark:border-white/5 flex items-center gap-2 text-[10px] font-mono bg-black/[0.02] dark:bg-white/[0.02]">
             <span className="text-slate-500 uppercase">In Chat:</span>
             {isGroup && <span className="px-2 py-0.5 rounded-sm bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20 font-bold ml-1 uppercase">GROUP</span>}
+            {activePeers.length > 1 && (
+              secured ? (
+                <span className="flex items-center gap-1 px-2 py-0.5 rounded-sm bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 font-bold uppercase" title="Noise_XX handshake complete on every channel — messages are end-to-end encrypted.">
+                  <ShieldCheck size={11} /> E2E_SECURED
+                </span>
+              ) : (
+                <span className="flex items-center gap-1 px-2 py-0.5 rounded-sm bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 font-bold uppercase animate-pulse" title="Establishing Noise_XX handshakes with peers...">
+                  <ShieldAlert size={11} /> HANDSHAKING
+                </span>
+              )
+            )}
             <div className="flex gap-2 overflow-x-auto custom-scrollbar no-scrollbar ml-2">
               {activePeers.map(p => (
                 <span key={p} className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full ${p === peerId ? 'bg-cyan-500/20 text-cyan-600 dark:text-cyan-400 border border-cyan-500/30' : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700'}`}>
                   {p === peerId ? `${displayName(p)} (You)` : displayName(p)}
+                  {p !== peerId && safetyNumbers[p] && (
+                    <span className="text-emerald-600 dark:text-emerald-400 cursor-help" title={`Safety number (compare out of band to verify no relay MITM):\n${safetyNumbers[p]}`}>
+                      <Fingerprint size={11} />
+                    </span>
+                  )}
                   {isHost && isGroup && p !== peerId && (
                     <button onClick={() => kickPeer(p)} className="hover:text-red-500 transition-colors ml-0.5" title="Kick user">
                       ✕
