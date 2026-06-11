@@ -15,8 +15,12 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   const [joinRequests, setJoinRequests] = useState<{peerId: string; message: string}[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isGroup, setIsGroup] = useState(false);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [ioLoad, setIoLoad] = useState<number>(0);
   const socketRef = useRef<WebSocket | null>(null);
   const readSentRef = useRef<Set<string>>(new Set());
+  const pingTimestampRef = useRef<Map<string, number>>(new Map());
+  const bytesInWindowRef = useRef<number>(0);
 
   // Disappear messages after 5 mins
   useEffect(() => {
@@ -26,9 +30,22 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     return () => clearInterval(interval);
   }, []);
 
+  // IO load: reset byte window every second, express as % of 1MB reference
+  // (1_000_000 matches MAX_PAYLOAD_BYTES in src/backend/core/constants.ts)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const bytes = bytesInWindowRef.current;
+      bytesInWindowRef.current = 0;
+      setIoLoad(Math.min((bytes / 1_000_000) * 100, 100));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   const sendRaw = useCallback((envelope: RelayEnvelope) => {
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify(envelope));
+      const data = JSON.stringify(envelope);
+      socketRef.current.send(data);
+      bytesInWindowRef.current += data.length;
     }
   }, []);
 
@@ -53,6 +70,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     };
 
     socket.onmessage = (event) => {
+      bytesInWindowRef.current += (event.data as string).length;
       const data = JSON.parse(event.data);
       
       if (data.type === 'joined') {
@@ -93,6 +111,15 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
 
       // It's a relay envelope
       const env = data as RelayEnvelope;
+
+      if (env.type === EnvelopeType.PONG) {
+        const sentAt = pingTimestampRef.current.get(env.nonce);
+        if (sentAt !== undefined) {
+          setLatencyMs(Date.now() - sentAt);
+          pingTimestampRef.current.delete(env.nonce);
+        }
+        return;
+      }
 
       if (env.type === EnvelopeType.ACK) {
         setMessages(prev => prev.map(m => {
@@ -193,6 +220,24 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     };
   }, [sessionId, peerId, connect]);
 
+  // Periodic PING to measure round-trip latency
+  useEffect(() => {
+    if (!isConnected || !sessionId || !peerId) return;
+    const interval = setInterval(() => {
+      const nonce = Math.random().toString(36).substring(7);
+      pingTimestampRef.current.set(nonce, Date.now());
+      sendRaw({
+        sessionId,
+        from: peerId,
+        type: EnvelopeType.PING,
+        timestamp: Date.now(),
+        nonce,
+        payload: '',
+      });
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [isConnected, sessionId, peerId, sendRaw]);
+
   const acceptJoin = useCallback((targetPeerId: string) => {
     if (!socketRef.current) return;
     socketRef.current.send(JSON.stringify({ type: 'accept_join', peerId: targetPeerId }));
@@ -210,5 +255,5 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     socketRef.current.send(JSON.stringify({ type: 'kick_peer', peerId: targetPeerId }));
   }, []);
 
-  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, markAsRead, acceptJoin, rejectJoin, kickPeer };
+  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad };
 }
