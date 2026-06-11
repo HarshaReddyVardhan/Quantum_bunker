@@ -1,7 +1,7 @@
 import { generateKeyPair } from '@stablelib/x25519';
-import { HandshakeState, KeyPair, Transport } from './noise-xx';
+import { HandshakeState, KeyPair } from './noise-xx';
+import { DoubleRatchet, DRKeyPair, RatchetSlot } from './double-ratchet';
 import {
-  EMPTY,
   utf8,
   fromUtf8,
   toBase64,
@@ -17,7 +17,7 @@ export interface NoiseFrame {
 }
 
 export interface EncryptedPayload {
-  c: Record<string, string>;
+  c: Record<string, RatchetSlot>;
 }
 
 type Phase = 'handshaking' | 'ready' | 'failed';
@@ -26,8 +26,11 @@ interface Channel {
   initiator: boolean;
   phase: Phase;
   hs: HandshakeState;
-  transport: Transport | null;
+  ratchet: DoubleRatchet | null;
   safetyNumber: string | null;
+  remoteStaticKey: Uint8Array | null;
+  drKeyPair: DRKeyPair;
+  remoteDRKey: Uint8Array | null;
 }
 
 interface PeerChannelsOptions {
@@ -58,8 +61,11 @@ export class PeerChannels {
       initiator,
       phase: 'handshaking',
       hs: new HandshakeState(initiator, this.staticKey),
-      transport: null,
+      ratchet: null,
       safetyNumber: null,
+      remoteStaticKey: null,
+      drKeyPair: generateKeyPair(),
+      remoteDRKey: null,
     };
   }
 
@@ -75,7 +81,6 @@ export class PeerChannels {
   onSignal(fromPeerId: string, frame: NoiseFrame): void {
     if (frame.to !== this.selfId) return;
 
-    // A fresh step-1 from a peer (e.g. after their reconnect) restarts the handshake.
     let channel = this.channels.get(fromPeerId);
     if (!channel || (frame.step === 1 && channel.phase !== 'handshaking')) {
       channel = this.newChannel(fromPeerId);
@@ -84,15 +89,30 @@ export class PeerChannels {
 
     try {
       const data = fromBase64(frame.data);
+
       if (channel.initiator && frame.step === 2) {
-        channel.hs.readMessage(data);
-        this.sendNoise(fromPeerId, { kind: 'noise', to: fromPeerId, step: 3, data: toBase64(channel.hs.writeMessage()) });
+        // Responder's message 2 payload carries their initial DR public key (encrypted).
+        const payload = channel.hs.readMessage(data);
+        if (payload.length === 32) channel.remoteDRKey = payload;
+        // Initiator sends message 3 with own DR public key as payload.
+        this.sendNoise(fromPeerId, {
+          kind: 'noise', to: fromPeerId, step: 3,
+          data: toBase64(channel.hs.writeMessage(channel.drKeyPair.publicKey)),
+        });
         this.finalize(channel);
+
       } else if (!channel.initiator && frame.step === 1) {
         channel.hs.readMessage(data);
-        this.sendNoise(fromPeerId, { kind: 'noise', to: fromPeerId, step: 2, data: toBase64(channel.hs.writeMessage()) });
+        // Responder sends message 2 with own DR public key as payload.
+        this.sendNoise(fromPeerId, {
+          kind: 'noise', to: fromPeerId, step: 2,
+          data: toBase64(channel.hs.writeMessage(channel.drKeyPair.publicKey)),
+        });
+
       } else if (!channel.initiator && frame.step === 3) {
-        channel.hs.readMessage(data);
+        // Initiator's message 3 payload carries their initial DR public key (encrypted).
+        const payload = channel.hs.readMessage(data);
+        if (payload.length === 32) channel.remoteDRKey = payload;
         this.finalize(channel);
       }
     } catch {
@@ -102,17 +122,25 @@ export class PeerChannels {
 
   private finalize(channel: Channel): void {
     if (!channel.hs.complete) return;
-    channel.transport = channel.hs.transport();
     channel.safetyNumber = safetyNumber(channel.hs.handshakeHash);
+    channel.remoteStaticKey = channel.hs.remoteStaticKey;
+
+    if (channel.remoteDRKey) {
+      const chainKey = channel.hs.chainKey;
+      channel.ratchet = channel.initiator
+        ? DoubleRatchet.initAlice(chainKey, channel.drKeyPair, channel.remoteDRKey)
+        : DoubleRatchet.initBob(chainKey, channel.drKeyPair, channel.remoteDRKey);
+    }
+
     channel.phase = 'ready';
   }
 
   encryptForAll(plaintext: string): EncryptedPayload {
-    const c: Record<string, string> = {};
+    const c: Record<string, RatchetSlot> = {};
     const bytes = utf8(plaintext);
     for (const [peerId, channel] of this.channels) {
-      if (channel.phase === 'ready' && channel.transport) {
-        c[peerId] = toBase64(channel.transport.send.encryptWithAd(EMPTY, bytes));
+      if (channel.phase === 'ready' && channel.ratchet) {
+        c[peerId] = channel.ratchet.encrypt(bytes);
       }
     }
     return { c };
@@ -120,11 +148,11 @@ export class PeerChannels {
 
   decryptFrom(fromPeerId: string, payload: EncryptedPayload): string | null {
     const channel = this.channels.get(fromPeerId);
-    if (!channel || channel.phase !== 'ready' || !channel.transport) return null;
+    if (!channel || channel.phase !== 'ready' || !channel.ratchet) return null;
     const slot = payload?.c?.[this.selfId];
-    if (typeof slot !== 'string') return null;
+    if (!slot || typeof slot !== 'object' || !slot.ct || !slot.h) return null;
     try {
-      return fromUtf8(channel.transport.recv.decryptWithAd(EMPTY, fromBase64(slot)));
+      return fromUtf8(channel.ratchet.decrypt(slot));
     } catch {
       return null;
     }
@@ -150,6 +178,24 @@ export class PeerChannels {
     }
     return out;
   }
+
+  // SHA-256 of each peer's authenticated static public key, hex-encoded.
+  // Both peers independently compute the same fingerprint for a given key;
+  // comparing out-of-band detects a relay-mounted MITM even if safety numbers
+  // are not checked.
+  fingerprints(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [peerId, channel] of this.channels) {
+      if (channel.remoteStaticKey) {
+        out[peerId] = toHex(sha256(channel.remoteStaticKey));
+      }
+    }
+    return out;
+  }
+
+  ownFingerprint(): string {
+    return toHex(sha256(this.staticKey.publicKey));
+  }
 }
 
 // Six groups of five digits derived from the handshake hash. Both peers share
@@ -163,6 +209,10 @@ function safetyNumber(handshakeHash: Uint8Array): string {
     groups.push((view.getUint32(0) % 100000).toString().padStart(5, '0'));
   }
   return groups.join(' ');
+}
+
+function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
 
 function loadOrCreateIdentity(sessionId: string): KeyPair {
@@ -184,3 +234,4 @@ function loadOrCreateIdentity(sessionId: string): KeyPair {
   }
   return pair;
 }
+

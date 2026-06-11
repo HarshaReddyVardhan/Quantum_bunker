@@ -148,6 +148,10 @@ export class SymmetricState {
     return plaintext;
   }
 
+  get chainKey(): Uint8Array {
+    return this.ck;
+  }
+
   // Returns the two transport CipherStates: the first is used by the initiator
   // to send (and the responder to receive), the second is the reverse.
   split(): [CipherState, CipherState] {

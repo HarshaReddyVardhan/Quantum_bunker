@@ -23,6 +23,8 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   const [typingAt, setTypingAt] = useState<Record<string, number>>({});
   const [secured, setSecured] = useState(false);
   const [safetyNumbers, setSafetyNumbers] = useState<Record<string, string>>({});
+  const [fingerprints, setFingerprints] = useState<Record<string, string>>({});
+  const [ownFingerprint, setOwnFingerprint] = useState<string | null>(null);
   const [p2pPeers, setP2pPeers] = useState<string[]>([]);
   const socketRef = useRef<WebSocket | null>(null);
   const channelsRef = useRef<PeerChannels | null>(null);
@@ -100,12 +102,15 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       selfId: peerId,
       sendNoise: (to: string, frame: NoiseFrame) => sendSignal({ ...frame }),
     });
+    setOwnFingerprint(channelsRef.current.ownFingerprint());
 
     const refreshCrypto = () => {
       const mgr = channelsRef.current;
       if (!mgr) return;
       setSafetyNumbers(mgr.safetyNumbers());
+      setFingerprints(mgr.fingerprints());
       setSecured(mgr.allReady(activePeersRef.current));
+      if (ownFingerprint === null) setOwnFingerprint(mgr.ownFingerprint());
     };
 
     const refreshTransport = () => {
@@ -443,5 +448,5 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   const transport: 'p2p' | 'relayed' =
     otherPeers.length > 0 && otherPeers.every(id => p2pPeers.includes(id)) ? 'p2p' : 'relayed';
 
-  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, p2pPeers, transport };
+  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport };
 }
