@@ -81,6 +81,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const joinMatch = window.location.pathname.match(/^\/join\/([^/]+)$/);
+    if (joinMatch) {
+      setJoinId(joinMatch[1].trim());
+      window.history.replaceState({}, '', '/');
+      return;
+    }
     const vault = new URLSearchParams(window.location.search).get('vault');
     if (vault) {
       setJoinId(vault.trim());
@@ -536,7 +542,7 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
   const [showLeftSidebar, setShowLeftSidebar] = useState(false);
   const [showRightSidebar, setShowRightSidebar] = useState(false);
 
-  const shareLink = `${window.location.origin}/?vault=${sessionId}`;
+  const shareLink = `${window.location.origin}/join/${sessionId}`;
 
   const displayName = (id: string) => peerAliases[id] || id.replace('peer-', 'PEER_');
 
