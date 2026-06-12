@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search, Pencil, Check, Ban, Paperclip, Download, FileText } from 'lucide-react';
+import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search, Pencil, Check, Ban, Paperclip, Download, FileText, Mic } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useRelay } from '../useRelay';
 import { normalizeQuery, messageMatches, splitOnQuery } from '../message-search';
 import { attachmentKind, attachmentDataUrl, formatBytes, MAX_FILE_BYTES } from '../file-transfer';
+import { VOICE_MIME_CANDIDATES, chooseSupportedMime, voiceFileName } from '../voice-record';
 import FingerprintCard from './FingerprintCard';
 
 interface ChatRoomProps {
@@ -81,7 +82,11 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
   const [editDraft, setEditDraft] = useState('');
   const [isDragging, setIsDragging] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioStreamRef = useRef<MediaStream | null>(null);
   const shareLink = `${window.location.origin}/join/${sessionId}`;
   const displayName = (id: string) => peerAliases[id] || id.replace('peer-', 'PEER_');
   const trimmedQuery = normalizeQuery(searchQuery);
@@ -140,6 +145,47 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
     const files = Array.from(e.clipboardData.files);
     if (files.length > 0 && activePeers.length > 1) { e.preventDefault(); void handleFiles(files); }
   };
+
+  const startRecording = async () => {
+    if (isRecording || activePeers.length <= 1) return;
+    if (typeof MediaRecorder === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      setFileError('Voice recording is not supported in this browser');
+      return;
+    }
+    const mime = chooseSupportedMime(VOICE_MIME_CANDIDATES, (m) => MediaRecorder.isTypeSupported(m));
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = stream;
+      const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+      recorder.onstop = () => {
+        const type = recorder.mimeType || mime || 'audio/webm';
+        const blob = new Blob(audioChunksRef.current, { type });
+        audioStreamRef.current?.getTracks().forEach(t => t.stop());
+        audioStreamRef.current = null;
+        if (blob.size > 0) {
+          void handleFiles([new File([blob], voiceFileName(type), { type })]);
+        }
+      };
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setIsRecording(true);
+    } catch {
+      setFileError('Microphone access denied');
+      audioStreamRef.current?.getTracks().forEach(t => t.stop());
+      audioStreamRef.current = null;
+    }
+  };
+
+  const stopRecording = () => {
+    if (!isRecording) return;
+    setIsRecording(false);
+    mediaRecorderRef.current?.stop();
+    mediaRecorderRef.current = null;
+  };
+
+  useEffect(() => () => { audioStreamRef.current?.getTracks().forEach(t => t.stop()); }, []);
   const copyId = () => { if (!isConnected) return; navigator.clipboard.writeText(sessionId); setCopied(true); setTimeout(() => setCopied(false), 2000); };
   const copyShareLink = () => { navigator.clipboard.writeText(shareLink); setLinkCopied(true); setTimeout(() => setLinkCopied(false), 2000); };
 
@@ -471,6 +517,11 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
               <button onClick={() => setFileError(null)} className="shrink-0 hover:text-red-800 dark:hover:text-red-200"><X size={12} /></button>
             </div>
           )}
+          {isRecording && (
+            <div className="max-w-5xl mx-auto mb-2 flex items-center gap-2 px-3 py-1.5 bg-red-500/10 border border-red-500/20 text-red-600 dark:text-red-400 text-[10px] font-mono uppercase tracking-widest">
+              <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" /> Recording — release to encrypt &amp; send
+            </div>
+          )}
           <form onSubmit={handleSend} className="h-12 flex gap-4 max-w-5xl mx-auto">
             <input
               ref={fileInputRef}
@@ -487,6 +538,19 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
               className="px-4 border border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400 hover:border-cyan-500/40 transition-colors disabled:opacity-20 flex items-center"
             >
               <Paperclip size={16} />
+            </button>
+            <button
+              type="button"
+              onMouseDown={() => void startRecording()}
+              onMouseUp={stopRecording}
+              onMouseLeave={stopRecording}
+              onTouchStart={(e) => { e.preventDefault(); void startRecording(); }}
+              onTouchEnd={(e) => { e.preventDefault(); stopRecording(); }}
+              disabled={!isConnected || activePeers.length <= 1 || isPending}
+              title="Hold to record a voice message, release to send"
+              className={`px-4 border transition-colors disabled:opacity-20 flex items-center select-none ${isRecording ? 'border-red-500/60 bg-red-500/15 text-red-500 animate-pulse' : 'border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400 hover:border-cyan-500/40'}`}
+            >
+              <Mic size={16} />
             </button>
             <div className="flex-1 bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 focus-within:border-cyan-500/50 transition-colors flex items-center px-4 font-mono text-sm group">
               <span className="text-cyan-600 dark:text-cyan-500 mr-3 select-none">$</span>
