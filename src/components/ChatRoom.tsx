@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode } from 'lucide-react';
+import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useRelay } from '../useRelay';
+import { normalizeQuery, messageMatches, splitOnQuery } from '../message-search';
 import FingerprintCard from './FingerprintCard';
 
 interface ChatRoomProps {
@@ -17,6 +18,14 @@ interface ChatRoomProps {
   reset: () => void;
 }
 
+function highlightMatches(text: string, query: string): React.ReactNode {
+  return splitOnQuery(text, query).map((seg, i) =>
+    seg.match
+      ? <mark key={i} className="bg-amber-300/70 dark:bg-amber-500/40 text-inherit rounded-sm px-0.5">{seg.text}</mark>
+      : <React.Fragment key={i}>{seg.text}</React.Fragment>
+  );
+}
+
 function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft, isExpired, securityOptions, reset }: ChatRoomProps) {
   const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport } = useRelay(sessionId, peerId);
   const [input, setInput] = useState('');
@@ -27,8 +36,13 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
   const [logs, setLogs] = useState<{ t: string; msg: string; color: string }[]>([]);
   const [showLeftSidebar, setShowLeftSidebar] = useState(false);
   const [showRightSidebar, setShowRightSidebar] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const shareLink = `${window.location.origin}/join/${sessionId}`;
   const displayName = (id: string) => peerAliases[id] || id.replace('peer-', 'PEER_');
+  const trimmedQuery = normalizeQuery(searchQuery);
+  const visibleMessages = trimmedQuery
+    ? messages.filter(m => messageMatches(m.payload, trimmedQuery))
+    : messages;
 
   useEffect(() => {
     QRCode.toDataURL(shareLink, { margin: 1, width: 240, color: { dark: '#0a0a0a', light: '#ffffff' } })
@@ -113,6 +127,31 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
               {linkCopied ? <><Share2 size={12} /> Link_Copied</> : <><Share2 size={12} /> Copy_Share_Link</>}
             </button>
             <p className="text-[9px] font-mono text-slate-500 italic uppercase tracking-tighter leading-relaxed text-center">Scan or share to auto-fill the vault hash</p>
+          </div>
+        </section>
+
+        <section>
+          <h3 className="mono-label mb-4 uppercase tracking-widest font-bold flex items-center gap-2"><Search size={12} /> Search Messages</h3>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 focus-within:border-cyan-500/50 transition-colors px-3 py-2">
+              <Search size={12} className="text-slate-400 shrink-0" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="FILTER_BY_KEYWORD"
+                className="flex-1 min-w-0 bg-transparent border-none outline-none text-[11px] font-mono text-slate-700 dark:text-slate-300 placeholder:text-slate-400 dark:placeholder:text-slate-700"
+                autoComplete="off"
+              />
+              {searchQuery && (
+                <button onClick={() => setSearchQuery('')} className="text-slate-400 hover:text-slate-900 dark:hover:text-white shrink-0" title="Clear search"><X size={12} /></button>
+              )}
+            </div>
+            {trimmedQuery && (
+              <p className="text-[9px] font-mono text-slate-500 uppercase tracking-tighter italic">
+                {visibleMessages.length} match{visibleMessages.length === 1 ? '' : 'es'} in this session
+              </p>
+            )}
           </div>
         </section>
 
@@ -236,7 +275,7 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
 
         <div className="flex-1 p-6 overflow-y-auto flex flex-col gap-6 custom-scrollbar">
           <AnimatePresence initial={false}>
-            {messages.map((msg, i) => {
+            {visibleMessages.map((msg, i) => {
               const isMe = msg.from === peerId;
               const accentColor = msg.from === 'peer-a' ? 'cyan' : 'orange';
               const alignClass = isMe ? 'items-end self-end text-right' : 'items-start self-start text-left';
@@ -265,7 +304,7 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
                     onMouseEnter={() => { if (!isMe) markAsRead(msg.nonce); }}
                     onTouchStart={() => { if (!isMe) markAsRead(msg.nonce); }}
                   >
-                    <div className={`relative z-10 ${antiCaptureTextClass}`}>{msg.payload}</div>
+                    <div className={`relative z-10 ${antiCaptureTextClass}`}>{trimmedQuery ? highlightMatches(msg.payload, trimmedQuery) : msg.payload}</div>
                     <div className="absolute inset-0 bg-gradient-to-br from-black/[0.01] dark:from-white/[0.02] to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
                   </div>
                 </motion.div>
@@ -279,6 +318,11 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
             <div className="flex-1 flex flex-col items-center justify-center text-center p-8 opacity-50">
               <Activity size={48} className="mb-4 text-amber-400 animate-pulse" />
               <p className="text-[10px] font-mono uppercase tracking-[0.3em] text-amber-500">Waiting for host approval...</p>
+            </div>
+          ) : trimmedQuery && visibleMessages.length === 0 && messages.length > 0 ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-center p-8 opacity-40">
+              <Search size={48} className="mb-4 text-slate-400 dark:text-slate-600" />
+              <p className="text-[10px] font-mono uppercase tracking-[0.3em] text-slate-500">No messages match "{searchQuery.trim()}"</p>
             </div>
           ) : messages.length === 0 && (
             <div className="flex-1 flex flex-col items-center justify-center text-center p-8 opacity-30">
