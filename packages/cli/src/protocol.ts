@@ -24,9 +24,15 @@ export interface RelayEnvelope {
 }
 
 export function newNonce(): string {
-  return Math.random().toString(36).substring(2, 11);
+  return randomHex(9);
 }
 
 export function randomPeerId(): string {
-  return `user-${Math.random().toString(36).substring(2, 8)}`;
+  return `user-${randomHex(6)}`;
+}
+
+function randomHex(bytes: number): string {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, b => b.toString(16).padStart(2, '0')).join('');
 }

@@ -2,6 +2,12 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { setupApp } from '../../server';
 import { Application } from 'express';
+import {
+  generateIdentity,
+  issueMembershipToken,
+  createJoinProof,
+  encodeToken,
+} from '../../src/shared/membership';
 
 describe('WebSocket Transport Integration', () => {
   let app: Application;
@@ -62,7 +68,7 @@ describe('WebSocket Transport Integration', () => {
   it('should broadcast messages between peers and enforce rate limit', async () => {
     // create session
     const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'RateLimit', expiresInSeconds: 600 });
-    const { sessionId, hostId } = res.body;
+    const { sessionId, hostId, hostRecoveryToken } = res.body;
 
     const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
     const peerWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
@@ -70,8 +76,8 @@ describe('WebSocket Transport Integration', () => {
       new Promise((r) => hostWs.once('open', r)),
       new Promise((r) => peerWs.once('open', r)),
     ]);
-    // host joins
-    hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId }));
+    // host joins (host authority requires the recovery token)
+    hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
     await waitForMessage(hostWs, 'joined');
     // peer joins (will be pending then accepted)
     const peerId = 'peer-b';
@@ -95,6 +101,148 @@ describe('WebSocket Transport Integration', () => {
     expect(rateError.code).toBe('RATE_LIMIT_EXCEEDED');
     hostWs.close();
     peerWs.close();
+  });
+
+  it('should reject claiming an admitted peerId without its peer token', async () => {
+    const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'Hijack', expiresInSeconds: 600 });
+    const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+    const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => hostWs.once('open', r));
+    hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+    await waitForMessage(hostWs, 'joined');
+
+    // Attacker knows the public hostId but holds no credential
+    const attackerWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => attackerWs.once('open', r));
+    attackerWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId }));
+    const err = await waitForMessage(attackerWs, 'error');
+    expect(err.code).toBe('INVALID_PEER_TOKEN');
+
+    hostWs.close();
+    attackerWs.close();
+  });
+
+  it('should reject envelopes whose from field does not match the socket identity', async () => {
+    const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'Spoof', expiresInSeconds: 600 });
+    const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+    const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => hostWs.once('open', r));
+    hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+    await waitForMessage(hostWs, 'joined');
+
+    hostWs.send(JSON.stringify({
+      type: 'noise-message', sessionId, from: 'somebody-else',
+      timestamp: Date.now(), nonce: 'spoof-1', payload: 'x',
+    }));
+    const err = await waitForMessage(hostWs, 'error');
+    expect(err.code).toBe('SENDER_MISMATCH');
+    hostWs.close();
+  });
+
+  it('auto-admits a whitelisted member with no host approval', async () => {
+    const host = generateIdentity();
+    const member = generateIdentity();
+
+    const res = await (await import('supertest')).default(app)
+      .post('/api/sessions')
+      .send({ name: 'Whitelist', expiresInSeconds: 600, hostPublicKey: host.publicKey });
+    const { sessionId } = res.body;
+
+    const token = encodeToken(issueMembershipToken(host.secretKey, member.publicKey, sessionId));
+    const peerId = 'member-1';
+    const proof = createJoinProof(member, sessionId, peerId, 'mn-1');
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => ws.once('open', r));
+    ws.send(JSON.stringify({ type: 'join', sessionId, peerId, membershipToken: token, joinProof: proof }));
+    const joined = await waitForMessage(ws, 'joined');
+    expect(joined.viaMembership).toBe(true);
+    expect(joined.peerToken).toBeDefined();
+    ws.close();
+  });
+
+  it('rejects a membership join whose proof key was not whitelisted', async () => {
+    const host = generateIdentity();
+    const member = generateIdentity();
+    const impostor = generateIdentity();
+
+    const res = await (await import('supertest')).default(app)
+      .post('/api/sessions')
+      .send({ name: 'Whitelist2', expiresInSeconds: 600, hostPublicKey: host.publicKey });
+    const { sessionId } = res.body;
+
+    // Token vouches for `member`, but the impostor signs the proof with their key.
+    const token = encodeToken(issueMembershipToken(host.secretKey, member.publicKey, sessionId));
+    const peerId = 'member-2';
+    const forgedProof = createJoinProof(impostor, sessionId, peerId, 'mn-2');
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => ws.once('open', r));
+    ws.send(JSON.stringify({ type: 'join', sessionId, peerId, membershipToken: token, joinProof: forgedProof }));
+    const err = await waitForMessage(ws, 'error');
+    expect(err.code).toBe('INVALID_MEMBERSHIP');
+    ws.close();
+  });
+
+  it('a captured membership join cannot be replayed to impersonate a member', async () => {
+    const host = generateIdentity();
+    const member = generateIdentity();
+
+    const res = await (await import('supertest')).default(app)
+      .post('/api/sessions')
+      .send({ name: 'Whitelist3', expiresInSeconds: 600, hostPublicKey: host.publicKey });
+    const { sessionId } = res.body;
+
+    const token = encodeToken(issueMembershipToken(host.secretKey, member.publicKey, sessionId));
+    const proof = createJoinProof(member, sessionId, 'member-3', 'mn-3');
+
+    const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => ws1.once('open', r));
+    ws1.send(JSON.stringify({ type: 'join', sessionId, peerId: 'member-3', membershipToken: token, joinProof: proof }));
+    await waitForMessage(ws1, 'joined');
+
+    // An attacker who captured the join frame replays it verbatim on a fresh
+    // socket. Once admitted, that identity is bound to its peer token (which the
+    // attacker never saw), so the replay is rejected.
+    const ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => ws2.once('open', r));
+    ws2.send(JSON.stringify({ type: 'join', sessionId, peerId: 'member-3', membershipToken: token, joinProof: proof }));
+    const err = await waitForMessage(ws2, 'error');
+    expect(['INVALID_PEER_TOKEN', 'INVALID_MEMBERSHIP']).toContain(err.code);
+    ws1.close();
+    ws2.close();
+  });
+
+  it('rejects a reused join-proof nonce for a not-yet-admitted member', async () => {
+    const host = generateIdentity();
+    const member = generateIdentity();
+
+    const res = await (await import('supertest')).default(app)
+      .post('/api/sessions')
+      .send({ name: 'WhitelistNonce', expiresInSeconds: 600, hostPublicKey: host.publicKey });
+    const { sessionId } = res.body;
+
+    const token = encodeToken(issueMembershipToken(host.secretKey, member.publicKey, sessionId));
+
+    // First admission consumes nonce 'shared-nonce'.
+    const proof1 = createJoinProof(member, sessionId, 'member-x', 'shared-nonce');
+    const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => ws1.once('open', r));
+    ws1.send(JSON.stringify({ type: 'join', sessionId, peerId: 'member-x', membershipToken: token, joinProof: proof1 }));
+    await waitForMessage(ws1, 'joined');
+
+    // A different peer id (never admitted) presenting the same nonce is blocked
+    // by the proof-nonce guard.
+    const proof2 = createJoinProof(member, sessionId, 'member-y', 'shared-nonce');
+    const ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => ws2.once('open', r));
+    ws2.send(JSON.stringify({ type: 'join', sessionId, peerId: 'member-y', membershipToken: token, joinProof: proof2 }));
+    const err = await waitForMessage(ws2, 'error');
+    expect(err.code).toBe('INVALID_MEMBERSHIP');
+    ws1.close();
+    ws2.close();
   });
 
   it('destroying a session should close all sockets', async () => {

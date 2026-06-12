@@ -6,13 +6,16 @@ import { IEventBus } from '../../application/ports/event-bus.port';
 import { RelayMessage } from '../../application/use-cases/relay-message.use-case';
 import { RelayEnvelopeSchema } from '../../../shared/contracts/v1/schemas';
 import { ISessionStore } from '../../application/ports/session-store.port';
-import { SessionStatus } from '../../../shared/contracts/v1/session';
-import { RELAY_LIMITS } from '../../core/constants';
+import { Session, SessionStatus } from '../../../shared/contracts/v1/session';
+import { RELAY_LIMITS, SESSION_LIMITS } from '../../core/constants';
+import { safeEqual, newToken, clientIp, isAllowedOrigin } from '../../core/security';
+import { decodeToken, verifyMembership, JoinProof } from '../../../shared/membership';
 
 export class WsTransport implements IRelayTransport {
   private connections = new Map<string, WebSocket>(); // "sessionId:peerId" -> socket
   private messageCounters = new Map<string, { count: number; lastReset: number }>();
   private ipCounters = new Map<string, { count: number; lastReset: number }>();
+  private usedProofNonces = new Map<string, number>(); // join-proof replay guard
 
   constructor(
     private readonly wss: WebSocketServer,
@@ -27,8 +30,34 @@ export class WsTransport implements IRelayTransport {
     this.relayMessage = relayMessage;
   }
 
+  pruneStaleCounters(): void {
+    const now = Date.now();
+    for (const [key, counter] of this.ipCounters) {
+      if (now - counter.lastReset > RELAY_LIMITS.CONN_WINDOW_MS * 2) this.ipCounters.delete(key);
+    }
+    for (const [key, counter] of this.messageCounters) {
+      if (now - counter.lastReset > 10_000) this.messageCounters.delete(key);
+    }
+    for (const [nonce, at] of this.usedProofNonces) {
+      if (now - at > RELAY_LIMITS.CONN_WINDOW_MS * 2) this.usedProofNonces.delete(nonce);
+    }
+  }
+
+  // Single-use guard: a captured join proof cannot be replayed within its
+  // freshness window.
+  private consumeProofNonce(sessionId: string, nonce: string): boolean {
+    const key = `${sessionId}:${nonce}`;
+    if (this.usedProofNonces.has(key)) return false;
+    if (this.usedProofNonces.size >= RELAY_LIMITS.NONCE_CACHE_MAX) {
+      const oldest = this.usedProofNonces.keys().next().value;
+      if (oldest !== undefined) this.usedProofNonces.delete(oldest);
+    }
+    this.usedProofNonces.set(key, Date.now());
+    return true;
+  }
+
   private checkIpLimit(req: IncomingMessage): boolean {
-    const ip = req.socket.remoteAddress || 'unknown';
+    const ip = clientIp(req);
     const now = Date.now();
     const counter = this.ipCounters.get(ip) || { count: 0, lastReset: now };
 
@@ -61,7 +90,24 @@ export class WsTransport implements IRelayTransport {
     return counter.count <= RELAY_LIMITS.MSG_PER_SECOND_LIMIT;
   }
 
+  private admitPeer(session: Session, peerId: string): string {
+    const token = session.peers[peerId]?.token || newToken();
+    session.peers[peerId] = { id: peerId, joinedAt: Date.now(), lastSeenAt: Date.now(), token };
+    session.participantCount = (session.participantCount || 0) + 1;
+    if (session.participantCount > 2) {
+      session.isGroup = true;
+    }
+    session.emptySince = null;
+    session.status = SessionStatus.ACTIVE;
+    return token;
+  }
+
   private async handleConnection(ws: WebSocket, req: IncomingMessage) {
+    if (!isAllowedOrigin(req.headers.origin, req.headers.host)) {
+      ws.close(1008, 'Origin not allowed');
+      return;
+    }
+
     if (!this.checkIpLimit(req)) {
       ws.send(JSON.stringify({ type: 'error', code: 'RATE_LIMIT_EXCEEDED', message: 'Connection rate limit exceeded' }));
       ws.close(1008, 'Rate limit exceeded');
@@ -70,23 +116,39 @@ export class WsTransport implements IRelayTransport {
 
     let currentPeerId: string | null = null;
     let currentSessionId: string | null = null;
+    let socketMsgCount = 0;
+    let socketMsgWindowStart = Date.now();
+
+    const joinTimeout = setTimeout(() => {
+      if (!currentPeerId) ws.close(1008, 'Join timeout');
+    }, RELAY_LIMITS.JOIN_TIMEOUT_MS);
+    ws.on('close', () => clearTimeout(joinTimeout));
 
     ws.on('message', async (data) => {
       try {
+        const now = Date.now();
+        if (now - socketMsgWindowStart > 1000) {
+          socketMsgCount = 1;
+          socketMsgWindowStart = now;
+        } else if (++socketMsgCount > RELAY_LIMITS.SOCKET_MSG_PER_SECOND_LIMIT) {
+          ws.send(JSON.stringify({ type: 'error', code: 'RATE_LIMIT_EXCEEDED', message: 'Message rate limit exceeded' }));
+          return;
+        }
+
         const raw = JSON.parse(data.toString());
-        
+
         // Initial handshake to join session
         if (raw.type === 'join') {
           const sessionId = raw.sessionId?.trim();
           const peerId = raw.peerId?.trim();
-          
+
           if (!sessionId || !peerId) {
             ws.send(JSON.stringify({ type: 'error', message: 'Missing sessionId or peerId' }));
             return;
           }
 
           const session = await this.store.get(sessionId);
-          
+
           if (!session) {
             ws.send(JSON.stringify({ type: 'error', message: 'Session not found' }));
             return;
@@ -97,43 +159,71 @@ export class WsTransport implements IRelayTransport {
             return;
           }
 
-          currentPeerId = peerId;
-          currentSessionId = sessionId;
           const connKey = `${sessionId}:${peerId}`;
 
-          // Host Recovery check
-          const providedRecoveryToken = raw.hostRecoveryToken;
-          if (providedRecoveryToken && providedRecoveryToken === session.hostRecoveryToken) {
-            // Reclaiming host status
-            session.hostId = peerId; // Update hostId to the new peerId if it changed
-            this.connections.set(connKey, ws);
-            session.peers[peerId] = { id: peerId, joinedAt: Date.now(), lastSeenAt: Date.now() };
-            session.participantCount = (session.participantCount || 0) + 1;
-            if (session.participantCount > 2) {
-              session.isGroup = true;
+          // Host recovery: possession of the recovery token is the only way
+          // to claim host authority — hostId alone proves nothing.
+          if (safeEqual(raw.hostRecoveryToken, session.hostRecoveryToken)) {
+            if (session.hostId !== peerId) {
+              delete session.peers[session.hostId];
+              session.hostId = peerId;
             }
-            session.emptySince = null;
-            session.status = SessionStatus.ACTIVE;
+            currentPeerId = peerId;
+            currentSessionId = sessionId;
+            this.connections.set(connKey, ws);
+            const peerToken = this.admitPeer(session, peerId);
             await this.store.save(session);
-            
-            ws.send(JSON.stringify({ type: 'joined', sessionId, peerId, isHost: true }));
+
+            ws.send(JSON.stringify({ type: 'joined', sessionId, peerId, isHost: true, peerToken }));
             this.broadcastPeerUpdate(session);
             return;
           }
 
-          if (peerId === session.hostId || session.peers[peerId]) {
-            // Host or already accepted peer joining
-            this.connections.set(connKey, ws);
-            session.peers[peerId] = { id: peerId, joinedAt: Date.now(), lastSeenAt: Date.now() };
-            session.participantCount = (session.participantCount || 0) + 1;
-            if (session.participantCount > 2) {
-              session.isGroup = true;
+          if (session.peers[peerId]) {
+            // Rejoining an admitted identity requires the peer token issued at
+            // first admission — peer IDs are public and prove nothing.
+            if (!safeEqual(raw.peerToken, session.peers[peerId].token)) {
+              ws.send(JSON.stringify({ type: 'error', code: 'INVALID_PEER_TOKEN', message: 'Invalid peer credentials' }));
+              ws.close(1008, 'Invalid peer credentials');
+              return;
             }
-            session.emptySince = null;
-            session.status = SessionStatus.ACTIVE;
+            currentPeerId = peerId;
+            currentSessionId = sessionId;
+            this.connections.set(connKey, ws);
+            const peerToken = this.admitPeer(session, peerId);
             await this.store.save(session);
-            
-            ws.send(JSON.stringify({ type: 'joined', sessionId, peerId }));
+
+            ws.send(JSON.stringify({ type: 'joined', sessionId, peerId, peerToken }));
+            this.broadcastPeerUpdate(session);
+            return;
+          }
+
+          // Whitelisted member: a host-signed membership token plus a live
+          // possession proof admits the peer with no host interaction and
+          // nothing stored server-side beyond the ephemeral session.
+          if (raw.membershipToken && raw.joinProof && session.hostPublicKey) {
+            const token = decodeToken(raw.membershipToken);
+            const proof = raw.joinProof as JoinProof;
+            if (!token) {
+              ws.send(JSON.stringify({ type: 'error', code: 'INVALID_MEMBERSHIP', message: 'Malformed membership token' }));
+              return;
+            }
+            const result = verifyMembership(session.hostPublicKey, sessionId, peerId, token, proof);
+            if (!result.valid) {
+              ws.send(JSON.stringify({ type: 'error', code: 'INVALID_MEMBERSHIP', message: result.reason }));
+              return;
+            }
+            if (!this.consumeProofNonce(sessionId, proof.nonce)) {
+              ws.send(JSON.stringify({ type: 'error', code: 'INVALID_MEMBERSHIP', message: 'Join proof already used' }));
+              return;
+            }
+            currentPeerId = peerId;
+            currentSessionId = sessionId;
+            this.connections.set(connKey, ws);
+            const peerToken = this.admitPeer(session, peerId);
+            await this.store.save(session);
+
+            ws.send(JSON.stringify({ type: 'joined', sessionId, peerId, peerToken, viaMembership: true }));
             this.broadcastPeerUpdate(session);
             return;
           }
@@ -148,9 +238,15 @@ export class WsTransport implements IRelayTransport {
           }
 
           session.pendingPeers = session.pendingPeers || {};
+          if (!session.pendingPeers[peerId] && Object.keys(session.pendingPeers).length >= SESSION_LIMITS.MAX_PENDING_PEERS) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Too many pending join requests' }));
+            return;
+          }
           session.pendingPeers[peerId] = { id: peerId, message: raw.message || 'Wants to join', requestedAt: Date.now() };
           await this.store.save(session);
 
+          currentPeerId = peerId;
+          currentSessionId = sessionId;
           this.connections.set(connKey, ws); // Keep connection alive but restricted
           hostWs.send(JSON.stringify({ type: 'join_request', peerId, message: raw.message || 'Wants to join' }));
           ws.send(JSON.stringify({ type: 'pending', message: 'Waiting for host approval...' }));
@@ -165,18 +261,13 @@ export class WsTransport implements IRelayTransport {
           const targetPeer = raw.peerId;
           if (session.pendingPeers && session.pendingPeers[targetPeer]) {
             delete session.pendingPeers[targetPeer];
-            session.peers[targetPeer] = { id: targetPeer, joinedAt: Date.now(), lastSeenAt: Date.now() };
-            session.participantCount = (session.participantCount || 0) + 1;
-            if (session.participantCount > 2) {
-              session.isGroup = true;
-            }
-            session.emptySince = null;
+            const peerToken = this.admitPeer(session, targetPeer);
             await this.store.save(session);
 
             const targetKey = `${currentSessionId}:${targetPeer}`;
             const targetWs = this.connections.get(targetKey);
             if (targetWs) {
-               targetWs.send(JSON.stringify({ type: 'joined', sessionId: currentSessionId, peerId: targetPeer }));
+               targetWs.send(JSON.stringify({ type: 'joined', sessionId: currentSessionId, peerId: targetPeer, peerToken }));
             }
             this.broadcastPeerUpdate(session);
           }
@@ -236,8 +327,8 @@ export class WsTransport implements IRelayTransport {
             ws.send(JSON.stringify({ type: 'error', code: 'RATE_LIMIT_EXCEEDED', message: 'Message rate limit exceeded' }));
             return;
           }
-          const session = await this.store.get(currentSessionId!);
-          if (!session || !session.peers[currentPeerId!]) {
+          const session = currentSessionId ? await this.store.get(currentSessionId) : null;
+          if (!session || !currentPeerId || !session.peers[currentPeerId]) {
              ws.send(JSON.stringify({ type: 'error', message: 'Not authorized or pending' }));
              return;
           }
@@ -255,11 +346,17 @@ export class WsTransport implements IRelayTransport {
           }
 
           const result = RelayEnvelopeSchema.safeParse(raw);
-          if (result.success) {
-            await this.relayMessage.execute(result.data);
-          } else {
-             ws.send(JSON.stringify({ type: 'error', message: 'Invalid envelope', details: result.error.issues }));
+          if (!result.success) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid envelope', details: result.error.issues }));
+            return;
           }
+          // Sender identity is bound to the authenticated socket — envelopes
+          // cannot speak for another peer.
+          if (result.data.from !== currentPeerId || result.data.sessionId !== currentSessionId) {
+            ws.send(JSON.stringify({ type: 'error', code: 'SENDER_MISMATCH', message: 'Envelope sender does not match connection identity' }));
+            return;
+          }
+          await this.relayMessage.execute(result.data);
         }
 
       } catch (err) {
@@ -270,8 +367,10 @@ export class WsTransport implements IRelayTransport {
     ws.on('close', async () => {
       if (currentPeerId && currentSessionId) {
         const connKey = `${currentSessionId}:${currentPeerId}`;
-        this.connections.delete(connKey);
-        
+        if (this.connections.get(connKey) === ws) {
+          this.connections.delete(connKey);
+        }
+
         const session = await this.store.get(currentSessionId);
         if (session && session.peers[currentPeerId]) {
           session.participantCount = Math.max(0, (session.participantCount || 1) - 1);
@@ -292,23 +391,39 @@ export class WsTransport implements IRelayTransport {
     });
   }
 
-  private broadcastPeerUpdate(session: any) {
+  private broadcastPeerUpdate(session: Session) {
     const peers = Object.keys(session.peers).filter(id => this.isPeerConnected(session.id, id));
+    const frame = JSON.stringify({ type: 'peer_update', peers, isGroup: !!session.isGroup });
     for (const peerId of peers) {
       const connKey = `${session.id}:${peerId}`;
       const ws = this.connections.get(connKey);
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'peer_update', peers, isGroup: !!session.isGroup }));
+        ws.send(frame);
       }
     }
   }
 
   async send(sessionId: string, peerId: string, envelope: RelayEnvelope): Promise<void> {
-    const connKey = `${sessionId}:${peerId}`;
-    const ws = this.connections.get(connKey);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(envelope));
+    this.sendFrame(sessionId, peerId, JSON.stringify(envelope));
+  }
+
+  async sendToMany(sessionId: string, peerIds: string[], envelope: RelayEnvelope): Promise<string[]> {
+    const frame = JSON.stringify(envelope);
+    const delivered: string[] = [];
+    for (const peerId of peerIds) {
+      if (this.sendFrame(sessionId, peerId, frame)) delivered.push(peerId);
     }
+    return delivered;
+  }
+
+  private sendFrame(sessionId: string, peerId: string, frame: string): boolean {
+    const ws = this.connections.get(`${sessionId}:${peerId}`);
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    // Backpressure guard: a slow consumer drops messages instead of growing
+    // the server's send buffer without bound.
+    if (ws.bufferedAmount > RELAY_LIMITS.MAX_BUFFERED_BYTES) return false;
+    ws.send(frame);
+    return true;
   }
 
   isPeerConnected(sessionId: string, peerId: string): boolean {

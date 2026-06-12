@@ -9,6 +9,17 @@ export interface SessionPeer {
   id: string;
   joinedAt: number;
   lastSeenAt: number;
+  token?: string;
+}
+
+export interface PublicSessionInfo {
+  id: string;
+  name?: string;
+  createdAt: number;
+  expiresAt: number;
+  status: SessionStatus;
+  participantCount: number;
+  maxPeers: number;
 }
 
 export interface Session {
@@ -19,6 +30,7 @@ export interface Session {
   lastActivityAt: number;
   hostId: string;
   hostRecoveryToken: string;
+  hostPublicKey?: string; // Ed25519 trust anchor for the membership whitelist
   peers: Record<string, SessionPeer>;
   pendingPeers: Record<string, { id: string; message: string; requestedAt: number }>;
   status: SessionStatus;

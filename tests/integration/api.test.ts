@@ -50,6 +50,28 @@ describe('HTTP API Integration Tests', () => {
     expect(getRes.body.name).toBe('Fetch Vault');
   });
 
+  it('must never expose secrets or peer identities in session metadata', async () => {
+    const createRes = await request(app)
+      .post('/api/sessions')
+      .send({ name: 'Leak Check', expiresInSeconds: 600 });
+
+    const getRes = await request(app).get(`/api/sessions/${createRes.body.sessionId}`);
+    expect(getRes.status).toBe(200);
+    expect(getRes.body.hostRecoveryToken).toBeUndefined();
+    expect(getRes.body.hostId).toBeUndefined();
+    expect(getRes.body.peers).toBeUndefined();
+    expect(getRes.body.pendingPeers).toBeUndefined();
+  });
+
+  it('should refuse to refresh a session with no active participants', async () => {
+    const createRes = await request(app)
+      .post('/api/sessions')
+      .send({ name: 'Refresh Vault', expiresInSeconds: 600 });
+
+    const refreshRes = await request(app).post(`/api/sessions/${createRes.body.sessionId}/refresh`);
+    expect(refreshRes.status).toBe(409);
+  });
+
   it('should return 404 for unknown session', async () => {
     const getRes = await request(app).get('/api/sessions/unknown-id');
     expect(getRes.status).toBe(404);

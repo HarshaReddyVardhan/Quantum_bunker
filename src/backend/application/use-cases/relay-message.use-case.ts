@@ -1,10 +1,13 @@
 import { RelayEnvelope } from '../../../shared/contracts/v1/envelope';
 import { RelayPolicy } from '../../core/policies/relay.policy';
+import { RELAY_LIMITS } from '../../core/constants';
 import { ISessionStore } from '../ports/session-store.port';
 import { IEventBus } from '../ports/event-bus.port';
 import { IRelayTransport } from '../ports/relay-transport.port';
 
 export class RelayMessage {
+  private seenNonces = new Map<string, number>();
+
   constructor(
     private readonly store: ISessionStore,
     private readonly transport: IRelayTransport,
@@ -24,21 +27,19 @@ export class RelayMessage {
       return;
     }
 
+    if (this.isReplay(envelope)) {
+      this.reject('Duplicate nonce', envelope);
+      return;
+    }
+
     const destinationPeers = Object.keys(session.peers).filter(id => id !== envelope.from);
     if (destinationPeers.length === 0) {
       this.reject('Recipient not joined', envelope);
       return;
     }
 
-    let relayed = false;
-    for (const destId of destinationPeers) {
-      if (this.transport.isPeerConnected(session.id, destId)) {
-        await this.transport.send(session.id, destId, envelope);
-        relayed = true;
-      }
-    }
-
-    if (!relayed) {
+    const delivered = await this.transport.sendToMany(session.id, destinationPeers, envelope);
+    if (delivered.length === 0) {
       this.reject('Recipient offline', envelope);
       return;
     }
@@ -57,12 +58,40 @@ export class RelayMessage {
     });
   }
 
+  private isReplay(envelope: RelayEnvelope): boolean {
+    const key = `${envelope.sessionId}:${envelope.from}:${envelope.nonce}`;
+    const now = Date.now();
+    if (this.seenNonces.has(key)) return true;
+    if (this.seenNonces.size >= RELAY_LIMITS.NONCE_CACHE_MAX) this.pruneNonces(now);
+    this.seenNonces.set(key, now);
+    return false;
+  }
+
+  private pruneNonces(now: number): void {
+    const cutoff = now - RELAY_LIMITS.TIMESTAMP_TOLERANCE_MS * 2;
+    for (const [key, at] of this.seenNonces) {
+      if (at < cutoff) this.seenNonces.delete(key);
+    }
+    // Insertion order means the oldest entries come first; under sustained
+    // pressure drop them so the cache can never grow without bound.
+    while (this.seenNonces.size >= RELAY_LIMITS.NONCE_CACHE_MAX) {
+      const oldest = this.seenNonces.keys().next().value;
+      if (oldest === undefined) break;
+      this.seenNonces.delete(oldest);
+    }
+  }
+
   private reject(reason: string, envelope: RelayEnvelope) {
     this.eventBus.emit({
       type: 'EnvelopeRejected',
       sessionId: envelope.sessionId,
       occurredAt: Date.now(),
-      payload: { reason, rawEnvelope: envelope },
+      // Zero-knowledge invariant: never let payload contents reach the event
+      // bus, which logs automatically.
+      payload: {
+        reason,
+        rawEnvelope: { ...envelope, payload: `[redacted ${envelope.payload?.length ?? 0} chars]` },
+      },
     });
   }
 }

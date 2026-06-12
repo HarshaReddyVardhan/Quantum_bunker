@@ -1,7 +1,9 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+﻿import { useState, useEffect, useCallback, useRef } from 'react';
 import { RelayEnvelope, EnvelopeType } from './shared/contracts/v1/envelope';
 import { PeerChannels, NoiseFrame } from './crypto/peer-channels';
 import { WebRTCMesh, RtcFrame, shouldUseP2P } from './transport/webrtc-mesh';
+import { randomId } from './random';
+import { buildJoinCredentials } from './membership-store';
 
 export interface LocalMessage extends RelayEnvelope {
   status: 'sending' | 'sent' | 'delivered' | 'seen';
@@ -70,7 +72,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       from: peerId,
       type: EnvelopeType.SIGNALING,
       timestamp: Date.now(),
-      nonce: Math.random().toString(36).substring(7),
+      nonce: randomId(),
       payload: JSON.stringify(obj),
     });
   }, [sessionId, peerId, sendRaw]);
@@ -187,7 +189,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
           } catch {
             text = null;
           }
-          // Not addressed to us, or no established channel yet — drop silently.
+          // Not addressed to us, or no established channel yet â€” drop silently.
           if (text === null) return;
         }
 
@@ -202,7 +204,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
           from: peerId,
           type: EnvelopeType.ACK,
           timestamp: Date.now(),
-          nonce: Math.random().toString(36).substring(7),
+          nonce: randomId(),
           payload: env.nonce,
         });
       }
@@ -225,12 +227,19 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       console.log('WS Connected');
       const msg = localStorage.getItem('qb-join-msg') || 'Hello';
       const recoveryToken = localStorage.getItem(`qb-recovery-${sessionId}`);
+      const peerToken = sessionStorage.getItem(`qb-peer-token-${sessionId}`);
+      // If this device holds a host-signed membership token for the vault, the
+      // server auto-admits without host approval.
+      const credentials = buildJoinCredentials(sessionId, peerId);
       socket.send(JSON.stringify({
         type: 'join',
         sessionId,
         peerId,
         message: msg,
-        hostRecoveryToken: recoveryToken
+        hostRecoveryToken: recoveryToken,
+        peerToken,
+        membershipToken: credentials?.membershipToken,
+        joinProof: credentials?.joinProof,
       }));
     };
 
@@ -242,6 +251,9 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
         setIsConnected(true);
         setIsPending(false);
         setError(null);
+        if (data.peerToken) {
+          sessionStorage.setItem(`qb-peer-token-${sessionId}`, data.peerToken);
+        }
         // Server might tell us we are host via recovery
         if (data.isHost) {
           // This would ideally update useSession, but we can at least log it or handle local state if needed
@@ -321,7 +333,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       from: peerId,
       type,
       timestamp: Date.now(),
-      nonce: Math.random().toString(36).substring(7),
+      nonce: randomId(),
       payload: wirePayload,
     };
 
@@ -370,7 +382,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       from: peerId,
       type: EnvelopeType.READ,
       timestamp: Date.now(),
-      nonce: Math.random().toString(36).substring(7),
+      nonce: randomId(),
       payload: nonce,
     });
   }, [sessionId, peerId, dispatch]);
@@ -390,7 +402,7 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   useEffect(() => {
     if (!isConnected || !sessionId || !peerId) return;
     const interval = setInterval(() => {
-      const nonce = Math.random().toString(36).substring(7);
+      const nonce = randomId();
       pingTimestampRef.current.set(nonce, Date.now());
       sendRaw({
         sessionId,

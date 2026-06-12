@@ -7,42 +7,75 @@ import helmet from 'helmet';
 import { createServer as createViteServer } from 'vite';
 import { createContainer } from './src/backend/entrypoints/container';
 import { CreateSessionRequestSchema } from './src/shared/contracts/v1/schemas';
-import { CLEANUP_INTERVAL_MS } from './src/backend/core/constants';
+import { PublicSessionInfo } from './src/shared/contracts/v1/session';
+import { CLEANUP_INTERVAL_MS, RELAY_LIMITS, REST_LIMITS, SESSION_LIMITS } from './src/backend/core/constants';
+import { safeEqual, trustProxy } from './src/backend/core/security';
+import { createRateLimiter } from './src/backend/adapters/http/rate-limit.middleware';
 
 export async function setupApp() {
   const app = express();
   const server = createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({
+    server,
+    path: '/ws',
+    maxPayload: RELAY_LIMITS.WS_MAX_FRAME_BYTES,
+  });
   const PORT = 3000;
+  const isProd = process.env.NODE_ENV === 'production';
+
+  if (trustProxy()) {
+    app.set('trust proxy', 1);
+  }
 
   const container = createContainer(wss);
 
   // Background Tasks
   const cleanupInterval = setInterval(() => {
+    container.transport.pruneStaleCounters();
     container.cleanupSessions.execute().catch(err => {
       console.error('Cleanup task failed:', err);
     });
   }, CLEANUP_INTERVAL_MS);
 
-  app.use(cors());
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean);
+  if (allowedOrigins.length > 0) {
+    app.use(cors({ origin: allowedOrigins }));
+  }
+  // The app is served same-origin; without ALLOWED_ORIGINS no CORS headers are
+  // emitted, so browsers on other origins cannot call the API.
+
   app.use(helmet({
-    contentSecurityPolicy: false, // Disable for dev environment iframe
+    contentSecurityPolicy: isProd
+      ? {
+          directives: {
+            ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+            'connect-src': ["'self'", 'ws:', 'wss:'],
+          },
+        }
+      : false, // Vite dev middleware needs inline scripts
   }));
   app.use(express.json());
+
+  const generalLimiter = createRateLimiter({ windowMs: REST_LIMITS.WINDOW_MS, max: REST_LIMITS.GENERAL_PER_WINDOW });
+  const createLimiter = createRateLimiter({ windowMs: REST_LIMITS.WINDOW_MS, max: REST_LIMITS.SESSION_CREATE_PER_WINDOW });
+  app.use('/api', generalLimiter);
 
   // API Routes
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: Date.now() });
   });
 
-  app.post('/api/sessions', async (req, res) => {
+  app.post('/api/sessions', createLimiter, async (req, res) => {
     try {
       const result = CreateSessionRequestSchema.safeParse(req.body);
       if (!result.success) {
         return res.status(400).json({ error: result.error.issues });
       }
 
-      const session = await container.createSession.execute(result.data.expiresInSeconds, result.data.name);
+      const session = await container.createSession.execute(result.data.expiresInSeconds, result.data.name, result.data.hostPublicKey);
       console.log(`[API] Created session: ${session.id}`);
       res.status(201).json({
         sessionId: session.id,
@@ -65,7 +98,17 @@ export async function setupApp() {
       return res.status(404).json({ error: 'Session not found' });
     }
     console.log(`[API] Fetched session: ${id}`);
-    res.json(session);
+    // Public metadata only — never the peer map, host identity, or any token.
+    const info: PublicSessionInfo = {
+      id: session.id,
+      name: session.name,
+      createdAt: session.createdAt,
+      expiresAt: session.expiresAt,
+      status: session.status,
+      participantCount: session.participantCount,
+      maxPeers: session.maxPeers,
+    };
+    res.json(info);
   });
 
   app.post('/api/sessions/:id/refresh', async (req, res) => {
@@ -73,15 +116,19 @@ export async function setupApp() {
     if (!session) {
       return res.status(404).json({ error: 'Session not found' });
     }
+    if (session.participantCount <= 0) {
+      return res.status(409).json({ error: 'Session has no active participants' });
+    }
 
-    // Extend session by another 15 mins (or whatever the default is), up to max TTL
-    const extension = 15 * 60 * 1000;
-    const newExpiresAt = Math.min(Date.now() + extension, session.createdAt + 24 * 60 * 60 * 1000);
+    const newExpiresAt = Math.min(
+      Date.now() + SESSION_LIMITS.DEFAULT_TTL_MS,
+      session.createdAt + SESSION_LIMITS.MAX_TTL_MS
+    );
     session.expiresAt = newExpiresAt;
     session.lastActivityAt = Date.now();
-    
+
     await container.store.save(session);
-    
+
     res.json({
       sessionId: session.id,
       expiresAt: session.expiresAt
@@ -95,7 +142,7 @@ export async function setupApp() {
       return res.status(404).json({ error: 'Session not found' });
     }
     const hostToken = req.headers['x-host-token'];
-    if (session.hostRecoveryToken !== hostToken) {
+    if (!safeEqual(hostToken, session.hostRecoveryToken)) {
       return res.status(403).json({ error: 'Only the host can destroy the session' });
     }
     await container.store.delete(id);
@@ -105,7 +152,7 @@ export async function setupApp() {
   });
 
   // Vite middleware for development
-  if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
+  if (!isProd && process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
