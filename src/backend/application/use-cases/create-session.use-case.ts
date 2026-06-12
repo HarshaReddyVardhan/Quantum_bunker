@@ -10,7 +10,7 @@ export class CreateSession {
     private readonly eventBus: IEventBus
   ) {}
 
-  async execute(expiresInSeconds?: number, name?: string): Promise<Session> {
+  async execute(expiresInSeconds?: number, name?: string, hostPublicKey?: string): Promise<Session> {
     const ttl = expiresInSeconds 
       ? expiresInSeconds * 1000 
       : SESSION_LIMITS.DEFAULT_TTL_MS;
@@ -18,7 +18,7 @@ export class CreateSession {
     const actualTtl = Math.min(ttl, SESSION_LIMITS.MAX_TTL_MS);
     
     const now = Date.now();
-    const hostId = `host-${Math.random().toString(36).substring(2, 8)}`;
+    const hostId = `host-${uuidv4().slice(0, 8)}`;
     const hostRecoveryToken = uuidv4();
     const sess: Session = {
       id: uuidv4(),
@@ -28,6 +28,7 @@ export class CreateSession {
       lastActivityAt: now,
       hostId,
       hostRecoveryToken,
+      hostPublicKey,
       peers: {
         [hostId]: { id: hostId, joinedAt: now, lastSeenAt: now }
       },

@@ -7,6 +7,8 @@ export default defineConfig({
     setupFiles: ['./vitest.setup.ts'],
     env: {
       RELAY_CONN_PER_IP_LIMIT: '2000',
+      REST_SESSION_CREATE_LIMIT: '100000',
+      REST_GENERAL_LIMIT: '100000',
     },
     coverage: {
       provider: 'v8',

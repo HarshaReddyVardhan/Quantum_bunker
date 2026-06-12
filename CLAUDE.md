@@ -130,6 +130,11 @@ server.ts                       ← Express + Vite middleware + WS + cleanup sch
 - Host recovery: UUID token to re-claim host on reconnect
 - Host kick: `kick_peer` WS message removes a peer
 - Group mode: automatically enabled when >2 peers join
+- Peer token: per-session secret issued at admission; required to re-claim a `peerId`
+- Whitelist (stateless): host issues an Ed25519-signed membership token for a member's
+  public key; member presents token + a fresh possession proof on `join` and is
+  auto-admitted with no host approval. The server holds only the host public key in
+  the ephemeral session — no membership state is persisted. See `src/shared/membership.ts`.
 
 ### Session Persistence (Client)
 - Active session: `sessionStorage` (survives page refresh, not tab close)
@@ -167,6 +172,14 @@ server.ts                       ← Express + Vite middleware + WS + cleanup sch
 | `CLEANUP_INTERVAL_MS` | 60 seconds |
 | `INACTIVITY_TTL_MS` | 30 minutes |
 | `EMPTY_SESSION_TTL_MS` | 5 minutes |
+| `MAX_PENDING_PEERS` | 10 |
+| `SOCKET_MSG_PER_SECOND_LIMIT` | 20 (all WS frame types) |
+| `JOIN_TIMEOUT_MS` | 10 seconds |
+| `MAX_BUFFERED_BYTES` | 4 MB (per-socket backpressure cutoff) |
+| `WS_MAX_FRAME_BYTES` | 1 MB + 64 KB |
+| `NONCE_CACHE_MAX` | 50,000 (server-side replay dedup) |
+| `SESSION_CREATE_PER_WINDOW` | 10/min per IP (env `REST_SESSION_CREATE_LIMIT`) |
+| `GENERAL_PER_WINDOW` | 120/min per IP (env `REST_GENERAL_LIMIT`) |
 
 All changes to limits go in `constants.ts` only — never hardcode numbers elsewhere.
 
@@ -175,10 +188,10 @@ All changes to limits go in `constants.ts` only — never hardcode numbers elsew
 ## HTTP API
 
 ```
-POST   /api/sessions               Create session
-GET    /api/sessions/:id           Get session metadata
-POST   /api/sessions/:id/refresh   Extend TTL
-DELETE /api/sessions/:id           Destroy (hostRecoveryToken in body)
+POST   /api/sessions               Create session (optional hostPublicKey enables whitelist)
+GET    /api/sessions/:id           Get public metadata only (never tokens, hostId, or peers)
+POST   /api/sessions/:id/refresh   Extend TTL (requires active participants)
+DELETE /api/sessions/:id           Destroy (X-Host-Token header)
 GET    /api/health                 Health check
 ```
 
@@ -188,16 +201,16 @@ GET    /api/health                 Health check
 
 **Client → Server:**
 ```
-join             { sessionId, peerId, message?, recoveryToken? }
+join             { sessionId, peerId, message?, hostRecoveryToken?, peerToken? }
 accept_join      { sessionId, targetPeerId }       [host only]
 reject_join      { sessionId, targetPeerId }       [host only]
 kick_peer        { sessionId, targetPeerId }       [host only]
-<RelayEnvelope>  Any envelope type for relay
+<RelayEnvelope>  Any envelope type for relay (from must match socket identity; PLAINTEXT refused)
 ```
 
 **Server → Client:**
 ```
-joined           { sessionId, peerId, isHost, expiresAt }
+joined           { sessionId, peerId, isHost?, peerToken }
 pending          { sessionId }
 peer_update      { peers: SessionPeer[] }
 join_request     { peerId, message }               [host only]

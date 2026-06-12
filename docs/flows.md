@@ -9,8 +9,8 @@
 6. Both open WS with `sessionId` + `peerId`.
 
 ## Messaging
-1. Peer sends `RelayEnvelope` (PLAINTEXT / NOISE).
-2. Server validates (no payload inspection) -> forwards to target/others.
+1. Peer sends `RelayEnvelope` (NOISE; plaintext relay is refused).
+2. Server validates (no payload inspection; `from` must match the socket identity; duplicate nonces are dropped) -> forwards to target/others.
 3. Receiver replies with `ACK` (delivered) and `READ` (seen) envelopes.
 4. Each valid message refreshes session inactivity timer.
 

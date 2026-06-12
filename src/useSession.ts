@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { CreateSessionResponse } from './shared/contracts/v1/session';
+import { randomId } from './random';
 
 export interface SavedSession {
   id: string;
@@ -44,12 +45,12 @@ export function useSession() {
     else sessionStorage.removeItem('qb-expiresAt');
   }, [sessionId, peerId, sessionName, isHost, expiresAt]);
 
-  const createSession = useCallback(async (name?: string) => {
+  const createSession = useCallback(async (name?: string, hostPublicKey?: string) => {
     try {
       const resp = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ name, hostPublicKey }),
       });
       const data: CreateSessionResponse = await resp.json();
       setSessionId(data.sessionId);
@@ -97,9 +98,13 @@ export function useSession() {
       const recoveryToken = localStorage.getItem(`qb-recovery-${trimmedId}`);
       const isRecoveringHost = !!recoveryToken;
 
-      const randomPeerId = `user-${Math.random().toString(36).substring(2, 8)}`;
-      const peerIdToUse = isRecoveringHost && data.hostId ? data.hostId : randomPeerId;
-      
+      // The recovery token re-binds host authority to whatever peerId we
+      // present, so a fresh random id is always safe to use.
+      const existingPeerId = sessionStorage.getItem('qb-sessionId') === trimmedId
+        ? sessionStorage.getItem('qb-peerId')
+        : null;
+      const peerIdToUse = existingPeerId || `user-${randomId(6)}`;
+
       setPeerId(peerIdToUse);
       setIsHost(isRecoveringHost);
       setIsExpired(false);

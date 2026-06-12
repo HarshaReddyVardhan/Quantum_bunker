@@ -1,5 +1,6 @@
 import { ISessionStore } from '../../application/ports/session-store.port';
 import { Session } from '../../../shared/contracts/v1/session';
+import { SESSION_LIMITS } from '../../core/constants';
 
 export class InMemorySessionStore implements ISessionStore {
   private sessions = new Map<string, Session>();
@@ -25,13 +26,12 @@ export class InMemorySessionStore implements ISessionStore {
 
   async cleanup(): Promise<Session[]> {
     const now = Date.now();
-    const INACTIVITY_TIMEOUT = 30 * 60 * 1000; // 30 minutes inactivity
     const deleted: Session[] = [];
-    
+
     for (const [id, sess] of this.sessions.entries()) {
       const isExpired = sess.expiresAt < now;
-      const isInactive = (now - sess.lastActivityAt) > INACTIVITY_TIMEOUT;
-      const isEmptyTooLong = sess.participantCount === 0 && sess.emptySince !== null && (now - sess.emptySince) > 5 * 60 * 1000;
+      const isInactive = (now - sess.lastActivityAt) > SESSION_LIMITS.INACTIVITY_TTL_MS;
+      const isEmptyTooLong = sess.participantCount === 0 && sess.emptySince !== null && (now - sess.emptySince) > SESSION_LIMITS.EMPTY_SESSION_TTL_MS;
 
       if (isExpired || isInactive || isEmptyTooLong) {
         this.sessions.delete(id);

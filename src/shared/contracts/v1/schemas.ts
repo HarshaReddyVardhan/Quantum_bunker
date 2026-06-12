@@ -13,4 +13,5 @@ export const RelayEnvelopeSchema = z.object({
 export const CreateSessionRequestSchema = z.object({
   name: z.string().max(64).optional(),
   expiresInSeconds: z.number().int().min(60).max(3600 * 24).optional(),
+  hostPublicKey: z.string().min(1).max(128).optional(),
 });

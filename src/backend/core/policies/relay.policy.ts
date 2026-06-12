@@ -1,4 +1,4 @@
-import { RelayEnvelope } from '../../../shared/contracts/v1/envelope';
+import { RelayEnvelope, EnvelopeType } from '../../../shared/contracts/v1/envelope';
 import { RELAY_LIMITS } from '../constants';
 
 export class RelayPolicy {
@@ -12,6 +12,11 @@ export class RelayPolicy {
 
     if (!envelope.payload || envelope.payload.length === 0) {
       return { valid: false, reason: 'Payload empty' };
+    }
+
+    // Zero-knowledge invariant: the relay only carries opaque encrypted blobs.
+    if (envelope.type === EnvelopeType.PLAINTEXT) {
+      return { valid: false, reason: 'Plaintext relay disabled' };
     }
 
     return { valid: true };
