@@ -1,8 +1,11 @@
+import type { FileLock } from './file-crypto';
+
 export interface FileAttachment {
   name: string;
   mime: string;
-  size: number;
-  data: string; // base64-encoded raw file bytes
+  size: number; // original raw byte size (before any password encryption)
+  data: string; // base64: raw file bytes, or password-encrypted ciphertext when `enc` is set
+  enc?: FileLock; // present => an extra password lock wraps `data`
 }
 
 export type AttachmentKind = 'image' | 'audio' | 'video' | 'file';
@@ -10,7 +13,7 @@ export type AttachmentKind = 'image' | 'audio' | 'video' | 'file';
 // Mirrors RELAY_LIMITS.MAX_FILE_BYTES in src/backend/core/constants.ts. The
 // frontend cannot import backend modules across the hexagonal boundary, so the
 // value is duplicated here with the backend kept as the source of truth.
-export const MAX_FILE_BYTES = 256 * 1024;
+export const MAX_FILE_BYTES = 5 * 1024 * 1024;
 
 export function isWithinFileLimit(size: number): boolean {
   return Number.isFinite(size) && size > 0 && size <= MAX_FILE_BYTES;
@@ -56,5 +59,28 @@ export function decodeFileAttachment(raw: string): FileAttachment | null {
   ) {
     return null;
   }
-  return { name: o.name.slice(0, 256), mime: o.mime.slice(0, 128), size: o.size, data: o.data };
+  const enc = decodeFileLock(o.enc);
+  if (o.enc !== undefined && enc === null) return null;
+  return {
+    name: o.name.slice(0, 256),
+    mime: o.mime.slice(0, 128),
+    size: o.size,
+    data: o.data,
+    ...(enc ? { enc } : {}),
+  };
+}
+
+function decodeFileLock(raw: unknown): FileLock | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const e = raw as Record<string, unknown>;
+  if (
+    (e.algo !== 'AES-GCM' && e.algo !== 'ChaCha20-Poly1305') ||
+    e.kdf !== 'PBKDF2-SHA256' ||
+    typeof e.iter !== 'number' ||
+    typeof e.salt !== 'string' ||
+    typeof e.iv !== 'string'
+  ) {
+    return null;
+  }
+  return { algo: e.algo, kdf: 'PBKDF2-SHA256', iter: e.iter, salt: e.salt, iv: e.iv };
 }

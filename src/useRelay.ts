@@ -10,6 +10,13 @@ import {
   decodeFileAttachment,
   isWithinFileLimit,
 } from './file-transfer';
+import { encryptFileData, FileCipher } from './file-crypto';
+import { toBase64 } from './crypto/noise-primitives';
+
+export interface SendFileOptions {
+  password?: string;
+  algo?: FileCipher;
+}
 
 export interface LocalMessage extends RelayEnvelope {
   status: 'sending' | 'sent' | 'delivered' | 'seen';
@@ -18,6 +25,7 @@ export interface LocalMessage extends RelayEnvelope {
   edited?: boolean;
   deleted?: boolean;
   file?: FileAttachment;
+  locked?: boolean; // sender-side flag: this file was sent password-protected
 }
 
 export function useRelay(sessionId: string | null, peerId: string | null) {
@@ -462,35 +470,44 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     });
   }, [sessionId, peerId, dispatch]);
 
-  const sendFile = useCallback(async (file: File): Promise<{ ok: boolean; error?: string }> => {
+  const sendFile = useCallback(async (
+    file: File,
+    opts: SendFileOptions = {},
+  ): Promise<{ ok: boolean; error?: string }> => {
     if (!isConnected || !sessionId || !peerId || activePeers.length <= 1) {
       return { ok: false, error: 'No peers connected' };
     }
     if (!isWithinFileLimit(file.size)) {
       return { ok: false, error: 'File exceeds size limit' };
     }
+    // Never let a file leave unencrypted: require the E2E channel manager. The
+    // old base64 fallback would have relayed cleartext if the handshake had not
+    // completed yet.
+    if (!channelsRef.current) {
+      return { ok: false, error: 'Secure channel not ready' };
+    }
 
-    const data = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = reader.result as string;
-        const comma = result.indexOf(',');
-        resolve(comma >= 0 ? result.slice(comma + 1) : result);
-      };
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(file);
-    });
+    const bytes = new Uint8Array(await file.arrayBuffer());
+
+    let data: string;
+    let enc: FileAttachment['enc'];
+    if (opts.password) {
+      const sealed = await encryptFileData(bytes, opts.password, opts.algo ?? 'AES-GCM');
+      data = sealed.data;
+      enc = sealed.lock;
+    } else {
+      data = toBase64(bytes);
+    }
 
     const attachment: FileAttachment = {
       name: file.name || 'file',
       mime: file.type || 'application/octet-stream',
       size: file.size,
       data,
+      ...(enc ? { enc } : {}),
     };
     const inner = encodeFileAttachment(attachment);
-    const wirePayload = channelsRef.current
-      ? JSON.stringify(channelsRef.current.encryptForAll(inner))
-      : inner;
+    const wirePayload = JSON.stringify(channelsRef.current.encryptForAll(inner));
     const nonce = randomId();
 
     dispatch({
@@ -502,9 +519,12 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
       payload: wirePayload,
     });
 
+    // Local echo keeps the cleartext attachment so the sender always sees their
+    // own file rendered, even when it was password-locked for the recipients.
     setMessages(prev => [...prev, {
       sessionId, from: peerId, type: EnvelopeType.FILE, timestamp: Date.now(), nonce,
-      payload: '', file: attachment, status: 'sent', deliveredTo: [], seenBy: [],
+      payload: '', file: { name: attachment.name, mime: attachment.mime, size: file.size, data: toBase64(bytes) },
+      locked: !!enc, status: 'sent', deliveredTo: [], seenBy: [],
     }]);
 
     return { ok: true };

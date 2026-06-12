@@ -42,7 +42,7 @@ describe('Domain Contracts - Schemas', () => {
       type: EnvelopeType.NOISE_MESSAGE,
       timestamp: Date.now(),
       nonce: 'unique-nonce-123',
-      payload: 'A'.repeat(1024 * 1024 + 1) // 1MB + 1 byte
+      payload: 'A'.repeat(16 * 1024 * 1024 + 1) // 16MB + 1 byte (over MAX_PAYLOAD_BYTES)
     };
     const result = RelayEnvelopeSchema.safeParse(invalidEnv);
     expect(result.success).toBe(false);

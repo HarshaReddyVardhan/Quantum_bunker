@@ -9,19 +9,22 @@ export const SESSION_LIMITS = {
 };
 
 export const RELAY_LIMITS = {
-  MAX_PAYLOAD_BYTES: 1024 * 1024, // 1MB
-  // Per-file raw byte cap (client-enforced before encryption). Kept well under
-  // MAX_PAYLOAD_BYTES because base64 + per-peer ratchet ciphertext inflate the
-  // wire payload several-fold in group sessions.
-  MAX_FILE_BYTES: 256 * 1024, // 256KB
-  WS_MAX_FRAME_BYTES: 1024 * 1024 + 64 * 1024, // envelope payload + JSON overhead
+  // Sized to carry one ~5MB file after base64 + per-peer ratchet ciphertext
+  // inflation (~1.8x). Group sends fan out per peer, so very large files in
+  // large groups may exceed this and be rejected — that is the intended safety
+  // valve protecting the in-memory relay from runaway memory use.
+  MAX_PAYLOAD_BYTES: 16 * 1024 * 1024, // 16MB
+  // Per-file raw byte cap (client-enforced before encryption). Supports short
+  // videos; kept under MAX_PAYLOAD_BYTES to leave room for encoding overhead.
+  MAX_FILE_BYTES: 5 * 1024 * 1024, // 5MB
+  WS_MAX_FRAME_BYTES: 16 * 1024 * 1024 + 64 * 1024, // envelope payload + JSON overhead
   TIMESTAMP_TOLERANCE_MS: 60 * 1000, // 1 minute drift allowed
   MSG_PER_SECOND_LIMIT: 10,
   SOCKET_MSG_PER_SECOND_LIMIT: 20, // all frame types, incl. control messages
   CONN_PER_IP_LIMIT: parseInt(process.env.RELAY_CONN_PER_IP_LIMIT || '50', 10),
   CONN_WINDOW_MS: 60 * 1000, // 1 minute
   JOIN_TIMEOUT_MS: 10 * 1000, // socket must join within this or be dropped
-  MAX_BUFFERED_BYTES: 4 * 1024 * 1024, // skip sends to backpressured sockets
+  MAX_BUFFERED_BYTES: 24 * 1024 * 1024, // skip sends to backpressured sockets
   NONCE_CACHE_MAX: 50_000,
 };
 

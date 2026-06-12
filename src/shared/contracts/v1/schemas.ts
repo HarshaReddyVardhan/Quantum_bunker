@@ -7,7 +7,7 @@ export const RelayEnvelopeSchema = z.object({
   type: z.nativeEnum(EnvelopeType),
   timestamp: z.number().int().positive(),
   nonce: z.string().min(1).max(128),
-  payload: z.string().max(1024 * 1024), // 1MB limit for now
+  payload: z.string().max(16 * 1024 * 1024), // mirrors RELAY_LIMITS.MAX_PAYLOAD_BYTES
 });
 
 export const CreateSessionRequestSchema = z.object({

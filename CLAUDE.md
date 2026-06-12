@@ -125,10 +125,19 @@ server.ts                       ← Express + Vite middleware + WS + cleanup sch
 - Edit/delete: `EDIT` carries an encrypted `{target, text}` blob; `DELETE` carries the
   target nonce as opaque metadata. Both are author-bound (`env.from` must match the
   original sender) and applied client-side — the relay forwards them blindly.
-- File/image/voice sharing: `FILE` carries an encrypted `FileAttachment` (base64 blob +
+- File/image/video/voice sharing: `FILE` carries an encrypted `FileAttachment` (base64 blob +
   metadata) over the same double-ratchet path as text. Raw size is client-capped at
-  `MAX_FILE_BYTES`. Voice messages are just `audio/webm` files captured via MediaRecorder.
+  `MAX_FILE_BYTES`. Voice messages are `audio/webm` files captured via MediaRecorder with
+  browser-level `echoCancellation`/`noiseSuppression`/`autoGainControl` enabled to cut
+  surrounding noise. Video files (`video/*`) render in a `<video>` player. `sendFile` refuses
+  to relay unless the E2E channel manager exists — there is no plaintext fallback.
   See `src/file-transfer.ts` and `src/voice-record.ts`.
+- Optional password layer: from the attach menu the sender picks "Password protected" or
+  "Send regular". Password-protected files are encrypted with PBKDF2-SHA256 (210k iters) +
+  a user-chosen AEAD (AES-GCM or ChaCha20-Poly1305) *before* entering the ratchet, so even
+  an admitted peer cannot open them without the secret. The password is shared out of band —
+  it never travels through the relay. Recipients see a locked card and enter the password to
+  reveal. See `src/file-crypto.ts`.
 - Message search: client-side real-time keyword filter + highlight (see `src/message-search.ts`)
 - Auto-disappear: messages vanish client-side after 5 minutes
 - Rate limit: 10 messages/second per peer; 50 connections/minute per IP
@@ -172,8 +181,8 @@ server.ts                       ← Express + Vite middleware + WS + cleanup sch
 | `DEFAULT_TTL_MS` | 15 minutes |
 | `MAX_TTL_MS` | 24 hours |
 | `RECONNECT_GRACE_MS` | 30 seconds |
-| `MAX_PAYLOAD_BYTES` | 1 MB |
-| `MAX_FILE_BYTES` | 256 KB (raw per-file cap, client-enforced before encryption) |
+| `MAX_PAYLOAD_BYTES` | 16 MB |
+| `MAX_FILE_BYTES` | 5 MB (raw per-file cap, client-enforced before encryption) |
 | `TIMESTAMP_TOLERANCE_MS` | 60 seconds |
 | `MSG_PER_SECOND_LIMIT` | 10 |
 | `CONN_PER_IP_LIMIT` | 50 |
@@ -184,8 +193,8 @@ server.ts                       ← Express + Vite middleware + WS + cleanup sch
 | `MAX_PENDING_PEERS` | 10 |
 | `SOCKET_MSG_PER_SECOND_LIMIT` | 20 (all WS frame types) |
 | `JOIN_TIMEOUT_MS` | 10 seconds |
-| `MAX_BUFFERED_BYTES` | 4 MB (per-socket backpressure cutoff) |
-| `WS_MAX_FRAME_BYTES` | 1 MB + 64 KB |
+| `MAX_BUFFERED_BYTES` | 24 MB (per-socket backpressure cutoff) |
+| `WS_MAX_FRAME_BYTES` | 16 MB + 64 KB |
 | `NONCE_CACHE_MAX` | 50,000 (server-side replay dedup) |
 | `SESSION_CREATE_PER_WINDOW` | 10/min per IP (env `REST_SESSION_CREATE_LIMIT`) |
 | `GENERAL_PER_WINDOW` | 120/min per IP (env `REST_GENERAL_LIMIT`) |
