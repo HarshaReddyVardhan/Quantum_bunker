@@ -4,10 +4,11 @@ type Counter = { count: number; windowStart: number };
 
 const SWEEP_THRESHOLD = 10_000;
 
-export function createRateLimiter(options: { windowMs: number; max: number }) {
+export function createRateLimiter(options: { windowMs: number; max: number; skip?: (req: Request) => boolean }) {
   const counters = new Map<string, Counter>();
 
   return function rateLimit(req: Request, res: Response, next: NextFunction): void {
+    if (options.skip?.(req)) { next(); return; }
     const now = Date.now();
     const key = req.ip || req.socket.remoteAddress || 'unknown';
     const counter = counters.get(key) || { count: 0, windowStart: now };
