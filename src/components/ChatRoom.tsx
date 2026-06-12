@@ -1,8 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode } from 'lucide-react';
+import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search, Pencil, Check, Ban, Paperclip, Download, FileText, Mic } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useRelay } from '../useRelay';
+import { normalizeQuery, messageMatches, splitOnQuery } from '../message-search';
+import { attachmentKind, attachmentDataUrl, formatBytes, MAX_FILE_BYTES } from '../file-transfer';
+import { VOICE_MIME_CANDIDATES, chooseSupportedMime, voiceFileName } from '../voice-record';
 import FingerprintCard from './FingerprintCard';
 
 interface ChatRoomProps {
@@ -17,8 +20,55 @@ interface ChatRoomProps {
   reset: () => void;
 }
 
+function highlightMatches(text: string, query: string): React.ReactNode {
+  return splitOnQuery(text, query).map((seg, i) =>
+    seg.match
+      ? <mark key={i} className="bg-amber-300/70 dark:bg-amber-500/40 text-inherit rounded-sm px-0.5">{seg.text}</mark>
+      : <React.Fragment key={i}>{seg.text}</React.Fragment>
+  );
+}
+
+function renderAttachment(att: import('../file-transfer').FileAttachment): React.ReactNode {
+  const kind = attachmentKind(att.mime);
+  const url = attachmentDataUrl(att);
+  if (kind === 'image') {
+    return (
+      <a href={url} target="_blank" rel="noopener noreferrer" className="block">
+        <img src={url} alt={att.name} className="max-h-64 max-w-full rounded border border-black/10 dark:border-white/10 object-contain" />
+        <span className="block mt-1 text-[9px] font-mono text-slate-400 truncate">{att.name} · {formatBytes(att.size)}</span>
+      </a>
+    );
+  }
+  if (kind === 'audio') {
+    return (
+      <div className="flex flex-col gap-1">
+        <audio controls src={url} className="w-full max-w-xs h-9" />
+        <span className="text-[9px] font-mono text-slate-400 truncate">{att.name} · {formatBytes(att.size)}</span>
+      </div>
+    );
+  }
+  if (kind === 'video') {
+    return (
+      <div className="flex flex-col gap-1">
+        <video controls src={url} className="max-h-64 max-w-full rounded border border-black/10 dark:border-white/10" />
+        <span className="text-[9px] font-mono text-slate-400 truncate">{att.name} · {formatBytes(att.size)}</span>
+      </div>
+    );
+  }
+  return (
+    <a href={url} download={att.name} className="flex items-center gap-3 px-3 py-2 border border-cyan-500/20 bg-cyan-500/5 hover:bg-cyan-500/10 transition-colors">
+      <FileText size={20} className="text-cyan-600 dark:text-cyan-400 shrink-0" />
+      <span className="min-w-0">
+        <span className="block text-xs font-mono text-slate-700 dark:text-slate-200 truncate">{att.name}</span>
+        <span className="block text-[9px] font-mono text-slate-400">{formatBytes(att.size)} · click to download</span>
+      </span>
+      <Download size={14} className="text-slate-400 ml-auto shrink-0" />
+    </a>
+  );
+}
+
 function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft, isExpired, securityOptions, reset }: ChatRoomProps) {
-  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport } = useRelay(sessionId, peerId);
+  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendFile, editMessage, deleteMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport } = useRelay(sessionId, peerId);
   const [input, setInput] = useState('');
   const [copied, setCopied] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
@@ -27,8 +77,22 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
   const [logs, setLogs] = useState<{ t: string; msg: string; color: string }[]>([]);
   const [showLeftSidebar, setShowLeftSidebar] = useState(false);
   const [showRightSidebar, setShowRightSidebar] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [editingNonce, setEditingNonce] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState('');
+  const [isDragging, setIsDragging] = useState(false);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioStreamRef = useRef<MediaStream | null>(null);
   const shareLink = `${window.location.origin}/join/${sessionId}`;
   const displayName = (id: string) => peerAliases[id] || id.replace('peer-', 'PEER_');
+  const trimmedQuery = normalizeQuery(searchQuery);
+  const visibleMessages = trimmedQuery
+    ? messages.filter(m => messageMatches(m.payload, trimmedQuery))
+    : messages;
 
   useEffect(() => {
     QRCode.toDataURL(shareLink, { margin: 1, width: 240, color: { dark: '#0a0a0a', light: '#ffffff' } })
@@ -50,6 +114,78 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
   }, [isConnected, error, reset]);
 
   const handleSend = (e: React.FormEvent) => { e.preventDefault(); if (!input.trim()) return; sendMessage(input); setInput(''); };
+  const beginEdit = (nonce: string, current: string) => { setEditingNonce(nonce); setEditDraft(current); };
+  const cancelEdit = () => { setEditingNonce(null); setEditDraft(''); };
+  const commitEdit = (nonce: string) => {
+    const next = editDraft.trim();
+    if (next) editMessage(nonce, next);
+    cancelEdit();
+  };
+
+  const handleFiles = async (files: FileList | File[] | null) => {
+    if (!files) return;
+    setFileError(null);
+    for (const file of Array.from(files)) {
+      const res = await sendFile(file);
+      if (!res.ok) {
+        setFileError(res.error === 'File exceeds size limit'
+          ? `${file.name} exceeds the ${formatBytes(MAX_FILE_BYTES)} limit`
+          : res.error || 'Upload failed');
+      }
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (activePeers.length > 1) void handleFiles(e.dataTransfer.files);
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const files = Array.from(e.clipboardData.files);
+    if (files.length > 0 && activePeers.length > 1) { e.preventDefault(); void handleFiles(files); }
+  };
+
+  const startRecording = async () => {
+    if (isRecording || activePeers.length <= 1) return;
+    if (typeof MediaRecorder === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      setFileError('Voice recording is not supported in this browser');
+      return;
+    }
+    const mime = chooseSupportedMime(VOICE_MIME_CANDIDATES, (m) => MediaRecorder.isTypeSupported(m));
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = stream;
+      const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+      recorder.onstop = () => {
+        const type = recorder.mimeType || mime || 'audio/webm';
+        const blob = new Blob(audioChunksRef.current, { type });
+        audioStreamRef.current?.getTracks().forEach(t => t.stop());
+        audioStreamRef.current = null;
+        if (blob.size > 0) {
+          void handleFiles([new File([blob], voiceFileName(type), { type })]);
+        }
+      };
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setIsRecording(true);
+    } catch {
+      setFileError('Microphone access denied');
+      audioStreamRef.current?.getTracks().forEach(t => t.stop());
+      audioStreamRef.current = null;
+    }
+  };
+
+  const stopRecording = () => {
+    if (!isRecording) return;
+    setIsRecording(false);
+    mediaRecorderRef.current?.stop();
+    mediaRecorderRef.current = null;
+  };
+
+  useEffect(() => () => { audioStreamRef.current?.getTracks().forEach(t => t.stop()); }, []);
   const copyId = () => { if (!isConnected) return; navigator.clipboard.writeText(sessionId); setCopied(true); setTimeout(() => setCopied(false), 2000); };
   const copyShareLink = () => { navigator.clipboard.writeText(shareLink); setLinkCopied(true); setTimeout(() => setLinkCopied(false), 2000); };
 
@@ -113,6 +249,31 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
               {linkCopied ? <><Share2 size={12} /> Link_Copied</> : <><Share2 size={12} /> Copy_Share_Link</>}
             </button>
             <p className="text-[9px] font-mono text-slate-500 italic uppercase tracking-tighter leading-relaxed text-center">Scan or share to auto-fill the vault hash</p>
+          </div>
+        </section>
+
+        <section>
+          <h3 className="mono-label mb-4 uppercase tracking-widest font-bold flex items-center gap-2"><Search size={12} /> Search Messages</h3>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 focus-within:border-cyan-500/50 transition-colors px-3 py-2">
+              <Search size={12} className="text-slate-400 shrink-0" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="FILTER_BY_KEYWORD"
+                className="flex-1 min-w-0 bg-transparent border-none outline-none text-[11px] font-mono text-slate-700 dark:text-slate-300 placeholder:text-slate-400 dark:placeholder:text-slate-700"
+                autoComplete="off"
+              />
+              {searchQuery && (
+                <button onClick={() => setSearchQuery('')} className="text-slate-400 hover:text-slate-900 dark:hover:text-white shrink-0" title="Clear search"><X size={12} /></button>
+              )}
+            </div>
+            {trimmedQuery && (
+              <p className="text-[9px] font-mono text-slate-500 uppercase tracking-tighter italic">
+                {visibleMessages.length} match{visibleMessages.length === 1 ? '' : 'es'} in this session
+              </p>
+            )}
           </div>
         </section>
 
@@ -234,9 +395,19 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
           </div>
         )}
 
-        <div className="flex-1 p-6 overflow-y-auto flex flex-col gap-6 custom-scrollbar">
+        <div
+          className="flex-1 p-6 overflow-y-auto flex flex-col gap-6 custom-scrollbar relative"
+          onDragOver={(e) => { if (activePeers.length > 1) { e.preventDefault(); setIsDragging(true); } }}
+          onDragLeave={(e) => { if (e.currentTarget === e.target) setIsDragging(false); }}
+          onDrop={handleDrop}
+        >
+          {isDragging && (
+            <div className="absolute inset-2 z-30 border-2 border-dashed border-cyan-500/60 bg-cyan-500/10 backdrop-blur-sm flex items-center justify-center pointer-events-none">
+              <span className="flex items-center gap-2 text-cyan-600 dark:text-cyan-400 font-mono text-xs uppercase tracking-widest"><Paperclip size={16} /> Drop to encrypt &amp; relay</span>
+            </div>
+          )}
           <AnimatePresence initial={false}>
-            {messages.map((msg, i) => {
+            {visibleMessages.map((msg, i) => {
               const isMe = msg.from === peerId;
               const accentColor = msg.from === 'peer-a' ? 'cyan' : 'orange';
               const alignClass = isMe ? 'items-end self-end text-right' : 'items-start self-start text-left';
@@ -260,14 +431,47 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
                     {isMe && <span className={`text-[10px] font-mono font-bold ${statusColor}`} title={titleText}>{statusText}</span>}
                     {isMe && <span className={`w-1.5 h-1.5 ${dotColor}`} />}
                   </div>
-                  <div
-                    className={`p-4 bg-black/[0.02] dark:bg-white/[0.03] border border-black/5 dark:border-white/5 ${borderClass} text-sm leading-relaxed text-slate-700 dark:text-slate-300 font-mono shadow-sm dark:shadow-xl relative overflow-hidden group transition-all duration-300 ${blurClass}`}
-                    onMouseEnter={() => { if (!isMe) markAsRead(msg.nonce); }}
-                    onTouchStart={() => { if (!isMe) markAsRead(msg.nonce); }}
-                  >
-                    <div className={`relative z-10 ${antiCaptureTextClass}`}>{msg.payload}</div>
-                    <div className="absolute inset-0 bg-gradient-to-br from-black/[0.01] dark:from-white/[0.02] to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
-                  </div>
+                  {msg.deleted ? (
+                    <div className={`p-4 bg-black/[0.02] dark:bg-white/[0.03] border border-dashed border-black/10 dark:border-white/10 ${borderClass} text-sm text-slate-400 dark:text-slate-600 font-mono italic flex items-center gap-2`}>
+                      <Ban size={13} /> message deleted
+                    </div>
+                  ) : isMe && editingNonce === msg.nonce ? (
+                    <div className={`p-3 bg-black/[0.02] dark:bg-white/[0.03] border border-cyan-500/40 ${borderClass} flex flex-col gap-2`}>
+                      <textarea
+                        autoFocus
+                        value={editDraft}
+                        onChange={(e) => setEditDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitEdit(msg.nonce); }
+                          if (e.key === 'Escape') cancelEdit();
+                        }}
+                        rows={2}
+                        className="w-full bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 outline-none focus:border-cyan-500/50 text-sm font-mono text-slate-700 dark:text-slate-300 p-2 resize-none text-left"
+                      />
+                      <div className="flex items-center justify-end gap-2">
+                        <button onClick={cancelEdit} className="flex items-center gap-1 text-[10px] font-mono uppercase text-slate-500 hover:text-slate-900 dark:hover:text-white px-2 py-1"><X size={12} /> Cancel</button>
+                        <button onClick={() => commitEdit(msg.nonce)} disabled={!editDraft.trim()} className="flex items-center gap-1 text-[10px] font-mono uppercase text-cyan-600 dark:text-cyan-400 border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 disabled:opacity-30 px-2 py-1"><Check size={12} /> Save</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      className={`p-4 bg-black/[0.02] dark:bg-white/[0.03] border border-black/5 dark:border-white/5 ${borderClass} text-sm leading-relaxed text-slate-700 dark:text-slate-300 font-mono shadow-sm dark:shadow-xl relative overflow-hidden group transition-all duration-300 ${blurClass}`}
+                      onMouseEnter={() => { if (!isMe) markAsRead(msg.nonce); }}
+                      onTouchStart={() => { if (!isMe) markAsRead(msg.nonce); }}
+                    >
+                      <div className={`relative z-10 ${antiCaptureTextClass}`}>
+                        {msg.file ? renderAttachment(msg.file) : (trimmedQuery ? highlightMatches(msg.payload, trimmedQuery) : msg.payload)}
+                        {msg.edited && <span className="ml-2 text-[9px] text-slate-400 dark:text-slate-600 italic">(edited)</span>}
+                      </div>
+                      <div className="absolute inset-0 bg-gradient-to-br from-black/[0.01] dark:from-white/[0.02] to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+                      {isMe && (
+                        <div className="absolute top-1 right-1 z-20 flex items-center gap-1 opacity-0 group-hover/message:opacity-100 transition-opacity">
+                          {!msg.file && <button onClick={() => beginEdit(msg.nonce, msg.payload)} title="Edit message" className="p-1 bg-white/80 dark:bg-black/60 border border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400"><Pencil size={11} /></button>}
+                          <button onClick={() => deleteMessage(msg.nonce)} title="Delete message" className="p-1 bg-white/80 dark:bg-black/60 border border-black/10 dark:border-white/10 text-slate-500 hover:text-red-500"><Trash2 size={11} /></button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </motion.div>
               );
             })}
@@ -279,6 +483,11 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
             <div className="flex-1 flex flex-col items-center justify-center text-center p-8 opacity-50">
               <Activity size={48} className="mb-4 text-amber-400 animate-pulse" />
               <p className="text-[10px] font-mono uppercase tracking-[0.3em] text-amber-500">Waiting for host approval...</p>
+            </div>
+          ) : trimmedQuery && visibleMessages.length === 0 && messages.length > 0 ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-center p-8 opacity-40">
+              <Search size={48} className="mb-4 text-slate-400 dark:text-slate-600" />
+              <p className="text-[10px] font-mono uppercase tracking-[0.3em] text-slate-500">No messages match "{searchQuery.trim()}"</p>
             </div>
           ) : messages.length === 0 && (
             <div className="flex-1 flex flex-col items-center justify-center text-center p-8 opacity-30">
@@ -301,14 +510,55 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
           )}
         </AnimatePresence>
 
-        <div className="h-20 border-t border-black/5 dark:border-white/5 p-4 shrink-0 bg-ui-elevated dark:bg-brand-elevated">
-          <form onSubmit={handleSend} className="h-full flex gap-4 max-w-5xl mx-auto">
+        <div className="border-t border-black/5 dark:border-white/5 p-4 shrink-0 bg-ui-elevated dark:bg-brand-elevated">
+          {fileError && (
+            <div className="max-w-5xl mx-auto mb-2 flex items-center justify-between gap-2 px-3 py-1.5 bg-red-500/10 border border-red-500/20 text-red-600 dark:text-red-400 text-[10px] font-mono uppercase tracking-tighter">
+              <span className="truncate">{fileError}</span>
+              <button onClick={() => setFileError(null)} className="shrink-0 hover:text-red-800 dark:hover:text-red-200"><X size={12} /></button>
+            </div>
+          )}
+          {isRecording && (
+            <div className="max-w-5xl mx-auto mb-2 flex items-center gap-2 px-3 py-1.5 bg-red-500/10 border border-red-500/20 text-red-600 dark:text-red-400 text-[10px] font-mono uppercase tracking-widest">
+              <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" /> Recording — release to encrypt &amp; send
+            </div>
+          )}
+          <form onSubmit={handleSend} className="h-12 flex gap-4 max-w-5xl mx-auto">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!isConnected || activePeers.length <= 1 || isPending}
+              title={`Attach file (max ${formatBytes(MAX_FILE_BYTES)}, encrypted before relay)`}
+              className="px-4 border border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400 hover:border-cyan-500/40 transition-colors disabled:opacity-20 flex items-center"
+            >
+              <Paperclip size={16} />
+            </button>
+            <button
+              type="button"
+              onMouseDown={() => void startRecording()}
+              onMouseUp={stopRecording}
+              onMouseLeave={stopRecording}
+              onTouchStart={(e) => { e.preventDefault(); void startRecording(); }}
+              onTouchEnd={(e) => { e.preventDefault(); stopRecording(); }}
+              disabled={!isConnected || activePeers.length <= 1 || isPending}
+              title="Hold to record a voice message, release to send"
+              className={`px-4 border transition-colors disabled:opacity-20 flex items-center select-none ${isRecording ? 'border-red-500/60 bg-red-500/15 text-red-500 animate-pulse' : 'border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400 hover:border-cyan-500/40'}`}
+            >
+              <Mic size={16} />
+            </button>
             <div className="flex-1 bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 focus-within:border-cyan-500/50 transition-colors flex items-center px-4 font-mono text-sm group">
               <span className="text-cyan-600 dark:text-cyan-500 mr-3 select-none">$</span>
               <input
                 type="text"
                 value={input}
                 onChange={(e) => { setInput(e.target.value); sendTyping(); }}
+                onPaste={handlePaste}
                 placeholder="Type encrypted payload..."
                 className="flex-1 bg-transparent border-none outline-none text-slate-700 dark:text-slate-300 placeholder:text-slate-400 dark:placeholder:text-slate-700"
                 autoComplete="off"

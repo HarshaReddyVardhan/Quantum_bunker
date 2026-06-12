@@ -4,11 +4,20 @@ import { PeerChannels, NoiseFrame } from './crypto/peer-channels';
 import { WebRTCMesh, RtcFrame, shouldUseP2P } from './transport/webrtc-mesh';
 import { randomId } from './random';
 import { buildJoinCredentials } from './membership-store';
+import {
+  FileAttachment,
+  encodeFileAttachment,
+  decodeFileAttachment,
+  isWithinFileLimit,
+} from './file-transfer';
 
 export interface LocalMessage extends RelayEnvelope {
   status: 'sending' | 'sent' | 'delivered' | 'seen';
   deliveredTo: string[];
   seenBy: string[];
+  edited?: boolean;
+  deleted?: boolean;
+  file?: FileAttachment;
 }
 
 export function useRelay(sessionId: string | null, peerId: string | null) {
@@ -153,6 +162,42 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
         return;
       }
 
+      // Edits carry an encrypted {target, text} blob. Only the original author
+      // (env.from) may mutate their own message; the guard makes spoofing inert.
+      if (env.type === EnvelopeType.EDIT) {
+        const mgr = channelsRef.current;
+        let decoded: string | null = null;
+        try {
+          decoded = mgr ? mgr.decryptFrom(env.from, JSON.parse(env.payload)) : null;
+        } catch {
+          decoded = null;
+        }
+        if (decoded === null) return;
+        try {
+          const { target, text } = JSON.parse(decoded);
+          if (typeof target === 'string' && typeof text === 'string') {
+            setMessages(prev => prev.map(m =>
+              m.nonce === target && m.from === env.from && !m.deleted
+                ? { ...m, payload: text, edited: true }
+                : m));
+          }
+        } catch {
+          // Ignore malformed edit frames.
+        }
+        return;
+      }
+
+      // Deletes only need the target nonce (no payload content), so they travel
+      // as opaque metadata like READ receipts. Author-bound by env.from.
+      if (env.type === EnvelopeType.DELETE) {
+        const target = env.payload;
+        setMessages(prev => prev.map(m =>
+          m.nonce === target && m.from === env.from
+            ? { ...m, payload: '', deleted: true, edited: false }
+            : m));
+        return;
+      }
+
       // SIGNALING payloads are client-interpreted control frames; the server
       // forwards them opaquely and never inspects the contents.
       if (env.type === EnvelopeType.SIGNALING) {
@@ -177,6 +222,36 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
         } catch {
           // Ignore malformed signaling frames
         }
+        return;
+      }
+
+      // File attachments are encrypted exactly like NOISE_MESSAGE; the cleartext
+      // is a JSON-encoded FileAttachment that never reaches the relay.
+      if (env.type === EnvelopeType.FILE) {
+        const mgr = channelsRef.current;
+        let decoded: string | null = null;
+        try {
+          decoded = mgr ? mgr.decryptFrom(env.from, JSON.parse(env.payload)) : null;
+        } catch {
+          decoded = null;
+        }
+        if (decoded === null) return;
+        const att = decodeFileAttachment(decoded);
+        if (!att) return;
+
+        setMessages(prev => {
+          if (prev.some(m => m.nonce === env.nonce)) return prev;
+          return [...prev, { ...env, payload: '', file: att, status: 'delivered', deliveredTo: [], seenBy: [] }];
+        });
+
+        dispatch({
+          sessionId: env.sessionId,
+          from: peerId,
+          type: EnvelopeType.ACK,
+          timestamp: Date.now(),
+          nonce: randomId(),
+          payload: env.nonce,
+        });
         return;
       }
 
@@ -387,6 +462,90 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
     });
   }, [sessionId, peerId, dispatch]);
 
+  const sendFile = useCallback(async (file: File): Promise<{ ok: boolean; error?: string }> => {
+    if (!isConnected || !sessionId || !peerId || activePeers.length <= 1) {
+      return { ok: false, error: 'No peers connected' };
+    }
+    if (!isWithinFileLimit(file.size)) {
+      return { ok: false, error: 'File exceeds size limit' };
+    }
+
+    const data = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        const comma = result.indexOf(',');
+        resolve(comma >= 0 ? result.slice(comma + 1) : result);
+      };
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+
+    const attachment: FileAttachment = {
+      name: file.name || 'file',
+      mime: file.type || 'application/octet-stream',
+      size: file.size,
+      data,
+    };
+    const inner = encodeFileAttachment(attachment);
+    const wirePayload = channelsRef.current
+      ? JSON.stringify(channelsRef.current.encryptForAll(inner))
+      : inner;
+    const nonce = randomId();
+
+    dispatch({
+      sessionId,
+      from: peerId,
+      type: EnvelopeType.FILE,
+      timestamp: Date.now(),
+      nonce,
+      payload: wirePayload,
+    });
+
+    setMessages(prev => [...prev, {
+      sessionId, from: peerId, type: EnvelopeType.FILE, timestamp: Date.now(), nonce,
+      payload: '', file: attachment, status: 'sent', deliveredTo: [], seenBy: [],
+    }]);
+
+    return { ok: true };
+  }, [isConnected, sessionId, peerId, activePeers.length, dispatch]);
+
+  const editMessage = useCallback((targetNonce: string, newText: string) => {
+    if (!sessionId || !peerId || !newText.trim()) return;
+    const inner = JSON.stringify({ target: targetNonce, text: newText });
+    const wirePayload = channelsRef.current
+      ? JSON.stringify(channelsRef.current.encryptForAll(inner))
+      : inner;
+    dispatch({
+      sessionId,
+      from: peerId,
+      type: EnvelopeType.EDIT,
+      timestamp: Date.now(),
+      nonce: randomId(),
+      payload: wirePayload,
+    });
+    setMessages(prev => prev.map(m =>
+      m.nonce === targetNonce && m.from === peerId && !m.deleted
+        ? { ...m, payload: newText, edited: true }
+        : m));
+  }, [sessionId, peerId, dispatch]);
+
+  const deleteMessage = useCallback((targetNonce: string) => {
+    if (!sessionId || !peerId) return;
+    dispatch({
+      sessionId,
+      from: peerId,
+      type: EnvelopeType.DELETE,
+      timestamp: Date.now(),
+      nonce: randomId(),
+      payload: targetNonce,
+    });
+    setMessages(prev => prev.map(m =>
+      m.nonce === targetNonce && m.from === peerId
+        ? { ...m, payload: '', deleted: true }
+        : m));
+  }, [sessionId, peerId, dispatch]);
+
   useEffect(() => {
     if (sessionId && peerId) {
       connect();
@@ -460,5 +619,5 @@ export function useRelay(sessionId: string | null, peerId: string | null) {
   const transport: 'p2p' | 'relayed' =
     otherPeers.length > 0 && otherPeers.every(id => p2pPeers.includes(id)) ? 'p2p' : 'relayed';
 
-  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport };
+  return { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendFile, editMessage, deleteMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport };
 }

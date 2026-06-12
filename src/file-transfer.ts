@@ -1,0 +1,60 @@
+export interface FileAttachment {
+  name: string;
+  mime: string;
+  size: number;
+  data: string; // base64-encoded raw file bytes
+}
+
+export type AttachmentKind = 'image' | 'audio' | 'video' | 'file';
+
+// Mirrors RELAY_LIMITS.MAX_FILE_BYTES in src/backend/core/constants.ts. The
+// frontend cannot import backend modules across the hexagonal boundary, so the
+// value is duplicated here with the backend kept as the source of truth.
+export const MAX_FILE_BYTES = 256 * 1024;
+
+export function isWithinFileLimit(size: number): boolean {
+  return Number.isFinite(size) && size > 0 && size <= MAX_FILE_BYTES;
+}
+
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function attachmentKind(mime: string): AttachmentKind {
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime.startsWith('video/')) return 'video';
+  return 'file';
+}
+
+export function attachmentDataUrl(att: FileAttachment): string {
+  return `data:${att.mime};base64,${att.data}`;
+}
+
+export function encodeFileAttachment(att: FileAttachment): string {
+  return JSON.stringify(att);
+}
+
+export function decodeFileAttachment(raw: string): FileAttachment | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const o = parsed as Record<string, unknown>;
+  if (
+    typeof o.name !== 'string' ||
+    typeof o.mime !== 'string' ||
+    typeof o.size !== 'number' ||
+    typeof o.data !== 'string' ||
+    o.data.length === 0
+  ) {
+    return null;
+  }
+  return { name: o.name.slice(0, 256), mime: o.mime.slice(0, 128), size: o.size, data: o.data };
+}

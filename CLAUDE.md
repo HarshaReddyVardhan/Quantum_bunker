@@ -119,9 +119,17 @@ server.ts                       ← Express + Vite middleware + WS + cleanup sch
 
 ### Messaging
 - Send: `RelayEnvelope` over WebSocket → server fans out to all other peers
-- Types: `PLAINTEXT`, `NOISE_MESSAGE`, `SIGNALING`, `PING`/`PONG`, `ACK`, `READ`
+- Types: `PLAINTEXT`, `NOISE_MESSAGE`, `SIGNALING`, `PING`/`PONG`, `ACK`, `READ`, `EDIT`, `DELETE`, `FILE`
 - ACK receipts: server sends `ACK` back to sender on relay
 - Read receipts: peer sends `READ` envelope with original nonce
+- Edit/delete: `EDIT` carries an encrypted `{target, text}` blob; `DELETE` carries the
+  target nonce as opaque metadata. Both are author-bound (`env.from` must match the
+  original sender) and applied client-side — the relay forwards them blindly.
+- File/image/voice sharing: `FILE` carries an encrypted `FileAttachment` (base64 blob +
+  metadata) over the same double-ratchet path as text. Raw size is client-capped at
+  `MAX_FILE_BYTES`. Voice messages are just `audio/webm` files captured via MediaRecorder.
+  See `src/file-transfer.ts` and `src/voice-record.ts`.
+- Message search: client-side real-time keyword filter + highlight (see `src/message-search.ts`)
 - Auto-disappear: messages vanish client-side after 5 minutes
 - Rate limit: 10 messages/second per peer; 50 connections/minute per IP
 
@@ -165,6 +173,7 @@ server.ts                       ← Express + Vite middleware + WS + cleanup sch
 | `MAX_TTL_MS` | 24 hours |
 | `RECONNECT_GRACE_MS` | 30 seconds |
 | `MAX_PAYLOAD_BYTES` | 1 MB |
+| `MAX_FILE_BYTES` | 256 KB (raw per-file cap, client-enforced before encryption) |
 | `TIMESTAMP_TOLERANCE_MS` | 60 seconds |
 | `MSG_PER_SECOND_LIMIT` | 10 |
 | `CONN_PER_IP_LIMIT` | 50 |

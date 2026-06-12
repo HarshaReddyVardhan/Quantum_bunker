@@ -6,6 +6,9 @@ export enum EnvelopeType {
   PONG = 'pong',
   ACK = 'ack',
   READ = 'read',
+  EDIT = 'edit',
+  DELETE = 'delete',
+  FILE = 'file',
 }
 
 export interface RelayEnvelope {

@@ -10,6 +10,10 @@ export const SESSION_LIMITS = {
 
 export const RELAY_LIMITS = {
   MAX_PAYLOAD_BYTES: 1024 * 1024, // 1MB
+  // Per-file raw byte cap (client-enforced before encryption). Kept well under
+  // MAX_PAYLOAD_BYTES because base64 + per-peer ratchet ciphertext inflate the
+  // wire payload several-fold in group sessions.
+  MAX_FILE_BYTES: 256 * 1024, // 256KB
   WS_MAX_FRAME_BYTES: 1024 * 1024 + 64 * 1024, // envelope payload + JSON overhead
   TIMESTAMP_TOLERANCE_MS: 60 * 1000, // 1 minute drift allowed
   MSG_PER_SECOND_LIMIT: 10,
