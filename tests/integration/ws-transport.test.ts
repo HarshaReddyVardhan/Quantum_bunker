@@ -263,4 +263,413 @@ describe('WebSocket Transport Integration', () => {
     // both sockets should receive close event
     await Promise.all([closePromise1, closePromise2]);
   });
+
+  // ─── P1c: Control-frame authority + lifecycle ──────────────────────────
+
+  describe('control-frame authority', () => {
+    it('reject_join: host can reject a pending peer', { timeout: 15000 }, async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'Reject', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => hostWs.once('open', r));
+      hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      await waitForMessage(hostWs, 'joined');
+
+      const guestWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => guestWs.once('open', r));
+
+      // Set up listeners BEFORE sending join (race condition: join_request
+      // from host may arrive before we set up the handler)
+      const hostReqPromise = waitForMessage(hostWs, 'join_request');
+      const guestPendingPromise = waitForMessage(guestWs, 'pending');
+      const guestClosePromise = new Promise<void>((resolve) => guestWs.once('close', () => resolve()));
+      const guestErrorPromise = waitForMessage(guestWs, 'error');
+
+      guestWs.send(JSON.stringify({ type: 'join', sessionId, peerId: 'guest' }));
+      await guestPendingPromise;
+
+      const hostReq = await hostReqPromise;
+      expect(hostReq.peerId).toBe('guest');
+
+      hostWs.send(JSON.stringify({ type: 'reject_join', peerId: 'guest' }));
+      const err = await guestErrorPromise;
+      expect(err.message).toContain('rejected');
+      await guestClosePromise;
+      expect(guestWs.readyState).toBe(WebSocket.CLOSED);
+      hostWs.close();
+    });
+
+    it('kick_peer: host can kick a peer from a group session', { timeout: 15000 }, async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'Kick', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => hostWs.once('open', r));
+      hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      await waitForMessage(hostWs, 'joined');
+
+      // Need 3 participants for isGroup=true (participantCount > 2)
+      const peerA = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const peerB = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await Promise.all([
+        new Promise((r) => peerA.once('open', r)),
+        new Promise((r) => peerB.once('open', r)),
+      ]);
+      peerA.send(JSON.stringify({ type: 'join', sessionId, peerId: 'a' }));
+      await waitForMessage(peerA, 'pending');
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'a' }));
+      await waitForMessage(peerA, 'joined');
+
+      peerB.send(JSON.stringify({ type: 'join', sessionId, peerId: 'b' }));
+      await waitForMessage(peerB, 'pending');
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'b' }));
+      await waitForMessage(peerB, 'joined');
+
+      // Host kicks peer B
+      const closePromise = new Promise<void>((resolve) => peerB.once('close', () => resolve()));
+      hostWs.send(JSON.stringify({ type: 'kick_peer', peerId: 'b' }));
+      const err = await waitForMessage(peerB, 'error');
+      expect(err.message).toContain('kicked');
+      await closePromise;
+      expect(peerB.readyState).toBe(WebSocket.CLOSED);
+
+      hostWs.close();
+      peerA.close();
+    });
+
+    it('kick_peer sends peer_update to remaining peers after kick', { timeout: 15000 }, async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'Kick2', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const peerA = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const peerB = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await Promise.all([
+        new Promise((r) => hostWs.once('open', r)),
+        new Promise((r) => peerA.once('open', r)),
+        new Promise((r) => peerB.once('open', r)),
+      ]);
+      hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      await waitForMessage(hostWs, 'joined');
+
+      peerA.send(JSON.stringify({ type: 'join', sessionId, peerId: 'a' }));
+      await waitForMessage(peerA, 'pending');
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'a' }));
+      await waitForMessage(peerA, 'joined');
+
+      peerB.send(JSON.stringify({ type: 'join', sessionId, peerId: 'b' }));
+      await waitForMessage(peerB, 'pending');
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'b' }));
+      await waitForMessage(peerB, 'joined');
+
+      // Set up listeners BEFORE kick (race: peer_update may arrive
+      // before we set up the handler after waiting for error/close)
+      const peerUpdatePromise = waitForMessage(peerB, 'peer_update');
+      const peerErrorPromise = waitForMessage(peerA, 'error');
+      const kickClose = new Promise<void>((resolve) => peerA.once('close', () => resolve()));
+
+      hostWs.send(JSON.stringify({ type: 'kick_peer', peerId: 'a' }));
+      await peerErrorPromise;
+      await kickClose;
+
+      // Peer B should receive a peer_update without 'a'
+      const update = await peerUpdatePromise;
+      expect(update.peers).not.toContain('a');
+      expect(update.peers).toContain(hostId);
+      expect(update.peers).toContain('b');
+
+      hostWs.close();
+      peerB.close();
+    });
+
+    it('non-host cannot issue accept_join, reject_join, or kick_peer', async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'AuthGuard', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const peerWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const guestWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await Promise.all([
+        new Promise((r) => hostWs.once('open', r)),
+        new Promise((r) => peerWs.once('open', r)),
+        new Promise((r) => guestWs.once('open', r)),
+      ]);
+
+      hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      await waitForMessage(hostWs, 'joined');
+
+      peerWs.send(JSON.stringify({ type: 'join', sessionId, peerId: 'peer-x' }));
+      await waitForMessage(peerWs, 'pending');
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'peer-x' }));
+      await waitForMessage(peerWs, 'joined');
+
+      guestWs.send(JSON.stringify({ type: 'join', sessionId, peerId: 'guest' }));
+      await waitForMessage(guestWs, 'pending');
+
+      // peer-x tries to accept guest — silently ignored (not host)
+      peerWs.send(JSON.stringify({ type: 'accept_join', peerId: 'guest' }));
+      // Guest should still be pending — no joined message arrives
+      const guestMsg = await Promise.race([
+        waitForMessage(guestWs, 'joined').then(() => 'joined'),
+        new Promise((resolve) => setTimeout(() => resolve('timeout'), 1000)),
+      ]);
+      expect(guestMsg).toBe('timeout');
+
+      // peer-x tries to reject guest — silently ignored
+      peerWs.send(JSON.stringify({ type: 'reject_join', peerId: 'guest' }));
+      // Guest should not get error
+      const guestMsg2 = await Promise.race([
+        waitForMessage(guestWs, 'error').then(() => 'error'),
+        new Promise((resolve) => setTimeout(() => resolve('timeout'), 1000)),
+      ]);
+      expect(guestMsg2).toBe('timeout');
+
+      // peer-x tries to kick host — silently ignored
+      peerWs.send(JSON.stringify({ type: 'kick_peer', peerId: hostId }));
+      // host should not be kicked
+      expect(hostWs.readyState).toBe(WebSocket.OPEN);
+
+      hostWs.close();
+      peerWs.close();
+      guestWs.close();
+    });
+
+    it('kick_peer in a 2-peer session is refused (not a group)', async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'TwoPeer', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const peerWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await Promise.all([
+        new Promise((r) => hostWs.once('open', r)),
+        new Promise((r) => peerWs.once('open', r)),
+      ]);
+      hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      await waitForMessage(hostWs, 'joined');
+
+      peerWs.send(JSON.stringify({ type: 'join', sessionId, peerId: 'peer-1' }));
+      await waitForMessage(peerWs, 'pending');
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'peer-1' }));
+      await waitForMessage(peerWs, 'joined');
+
+      // 2 peers — host tries to kick peer-1. Should be refused (session.isGroup is false)
+      hostWs.send(JSON.stringify({ type: 'kick_peer', peerId: 'peer-1' }));
+      // Peer should NOT be kicked (no error message)
+      const peerMsg = await Promise.race([
+        waitForMessage(peerWs, 'error').then(() => 'error'),
+        new Promise((resolve) => setTimeout(() => resolve('timeout'), 1000)),
+      ]);
+      expect(peerMsg).toBe('timeout');
+      expect(peerWs.readyState).toBe(WebSocket.OPEN);
+
+      hostWs.close();
+      peerWs.close();
+    });
+
+    it('host cannot be kicked', async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'KickHost', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => hostWs.once('open', r));
+      hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      await waitForMessage(hostWs, 'joined');
+
+      // Add two peers to make it a group (isGroup = true when participantCount > 2)
+      const peerA = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const peerB = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await Promise.all([
+        new Promise((r) => peerA.once('open', r)),
+        new Promise((r) => peerB.once('open', r)),
+      ]);
+      peerA.send(JSON.stringify({ type: 'join', sessionId, peerId: 'a' }));
+      await waitForMessage(peerA, 'pending');
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'a' }));
+      await waitForMessage(peerA, 'joined');
+
+      peerB.send(JSON.stringify({ type: 'join', sessionId, peerId: 'b' }));
+      await waitForMessage(peerB, 'pending');
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'b' }));
+      await waitForMessage(peerB, 'joined');
+
+      // Peer A tries to kick host — silently ignored
+      peerA.send(JSON.stringify({ type: 'kick_peer', peerId: hostId }));
+      // Host should NOT be kicked
+      const hostMsg = await Promise.race([
+        waitForMessage(hostWs, 'error').then(() => 'error'),
+        new Promise((resolve) => setTimeout(() => resolve('timeout'), 1000)),
+      ]);
+      expect(hostMsg).toBe('timeout');
+      expect(hostWs.readyState).toBe(WebSocket.OPEN);
+
+      hostWs.close();
+      peerA.close();
+      peerB.close();
+    });
+
+    it('PING is echoed as PONG to sender only, not relayed to peers', async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'PingPong', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const peerWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await Promise.all([
+        new Promise((r) => hostWs.once('open', r)),
+        new Promise((r) => peerWs.once('open', r)),
+      ]);
+
+      hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      await waitForMessage(hostWs, 'joined');
+
+      peerWs.send(JSON.stringify({ type: 'join', sessionId, peerId: 'peer-1' }));
+      await waitForMessage(peerWs, 'pending');
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'peer-1' }));
+      await waitForMessage(peerWs, 'joined');
+
+      // Host sends a PING
+      hostWs.send(JSON.stringify({
+        sessionId, from: hostId, type: 'ping', timestamp: Date.now(), nonce: 'ping-1', payload: '',
+      }));
+
+      const pong = await waitForMessage(hostWs, 'pong');
+      expect(pong.nonce).toBe('ping-1');
+      expect(pong.from).toBe('server');
+
+      // Peer should NOT receive a ping or pong
+      const peerMsg = await Promise.race([
+        waitForMessage(peerWs, 'ping').then(() => 'ping'),
+        waitForMessage(peerWs, 'pong').then(() => 'pong'),
+        new Promise((resolve) => setTimeout(() => resolve('none'), 1000)),
+      ]);
+      expect(peerMsg).toBe('none');
+
+      hostWs.close();
+      peerWs.close();
+    });
+
+    it('join timeout: socket that does not send join within JOIN_TIMEOUT_MS is closed', { timeout: 15000 }, async () => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => ws.once('open', r));
+
+      const closePromise = new Promise<number>((resolve) => {
+        ws.once('close', (code) => resolve(code));
+      });
+
+      const code = await closePromise;
+      expect(code).toBe(1008);
+      // Socket should not be open
+      expect(ws.readyState).toBe(WebSocket.CLOSED);
+    });
+
+    it('pending-peer overflow: 11th guest is rejected when MAX_PENDING_PEERS reached', async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'Overflow', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => hostWs.once('open', r));
+      hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      await waitForMessage(hostWs, 'joined');
+
+      // Fill to MAX_PENDING_PEERS (10)
+      const guests: WebSocket[] = [];
+      for (let i = 0; i < 10; i++) {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+        await new Promise((r) => ws.once('open', r));
+        ws.send(JSON.stringify({ type: 'join', sessionId, peerId: `guest-${i}` }));
+        await waitForMessage(ws, 'pending');
+        guests.push(ws);
+      }
+
+      // 11th guest should be rejected
+      const ws11 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => ws11.once('open', r));
+      ws11.send(JSON.stringify({ type: 'join', sessionId, peerId: 'guest-10' }));
+      const err = await waitForMessage(ws11, 'error');
+      expect(err.message).toContain('Too many pending');
+
+      // Cleanup
+      hostWs.close();
+      for (const g of guests) g.close();
+      ws11.close();
+    }, 15000);
+
+    it('peer-token rejoin: disconnected peer can rejoin with its peer token', async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'Rejoin', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => hostWs.once('open', r));
+      hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      await waitForMessage(hostWs, 'joined');
+
+      const peerWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => peerWs.once('open', r));
+      peerWs.send(JSON.stringify({ type: 'join', sessionId, peerId: 'p1' }));
+      await waitForMessage(peerWs, 'pending');
+
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: 'p1' }));
+      const joined = await waitForMessage(peerWs, 'joined');
+      const peerToken = joined.peerToken;
+      expect(peerToken).toBeDefined();
+
+      // Disconnect
+      peerWs.close();
+
+      // Rejoin with the peer token
+      const peerWs2 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => peerWs2.once('open', r));
+      peerWs2.send(JSON.stringify({ type: 'join', sessionId, peerId: 'p1', peerToken }));
+      const rejoined = await waitForMessage(peerWs2, 'joined');
+      expect(rejoined.peerToken).toBeDefined();
+
+      hostWs.close();
+      peerWs2.close();
+    });
+
+    it('host-recovery reclaim: second socket with recovery token takes host identity', async () => {
+      const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'Recovery', expiresInSeconds: 600 });
+      const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+      // Host joins
+      const hostWs1 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => hostWs1.once('open', r));
+      hostWs1.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+      const joined1 = await waitForMessage(hostWs1, 'joined');
+      expect(joined1.isHost).toBe(true);
+
+      // Second socket claims host with recovery token — moves host identity
+      const hostWs2 = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r) => hostWs2.once('open', r));
+      hostWs2.send(JSON.stringify({ type: 'join', sessionId, peerId: 'host-v2', hostRecoveryToken }));
+      const joined2 = await waitForMessage(hostWs2, 'joined');
+      expect(joined2.isHost).toBe(true);
+      expect(joined2.peerId).toBe('host-v2');
+
+      // Original host socket still open but is no longer host (its peer mapping was removed)
+      hostWs1.close();
+      hostWs2.close();
+    });
+  });
+
+  // ─── P1d: Socket-level frame rate limit ────────────────────────────────
+
+  it('socket-level rate limit: burst of control frames trips SOCKET_MSG_PER_SECOND_LIMIT', async () => {
+    const res = await (await import('supertest')).default(app).post('/api/sessions').send({ name: 'SockRate', expiresInSeconds: 600 });
+    const { sessionId, hostId, hostRecoveryToken } = res.body;
+
+    const hostWs = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise((r) => hostWs.once('open', r));
+    hostWs.send(JSON.stringify({ type: 'join', sessionId, peerId: hostId, hostRecoveryToken }));
+    await waitForMessage(hostWs, 'joined');
+
+    // Burst of control frames (accept_join for a fake peer) to trip SOCKET_MSG_PER_SECOND_LIMIT (20)
+    for (let i = 0; i < 100; i++) {
+      hostWs.send(JSON.stringify({ type: 'accept_join', peerId: `fake-${i}` }));
+    }
+
+    const err = await waitForMessage(hostWs, 'error');
+    expect(err.code).toBe('RATE_LIMIT_EXCEEDED');
+    hostWs.close();
+  });
 });
