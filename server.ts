@@ -9,7 +9,7 @@ import { createContainer } from './src/backend/entrypoints/container';
 import { CreateSessionRequestSchema } from './src/shared/contracts/v1/schemas';
 import { PublicSessionInfo } from './src/shared/contracts/v1/session';
 import { CLEANUP_INTERVAL_MS, RELAY_LIMITS, REST_LIMITS, SESSION_LIMITS } from './src/backend/core/constants';
-import { safeEqual, trustProxy } from './src/backend/core/security';
+import { safeEqual, trustProxy, torMode, onionAddress } from './src/backend/core/security';
 import { createRateLimiter } from './src/backend/adapters/http/rate-limit.middleware';
 
 export async function setupApp() {
@@ -37,30 +37,43 @@ export async function setupApp() {
     });
   }, CLEANUP_INTERVAL_MS);
 
+  const onion = onionAddress();
+
   const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
     .split(',')
     .map(o => o.trim())
     .filter(Boolean);
+  // When an onion address is configured, automatically allow its HTTP origin
+  // so Tor Browser can reach the API without requiring manual ALLOWED_ORIGINS.
+  if (onion) {
+    const onionOrigin = `http://${onion}`;
+    if (!allowedOrigins.includes(onionOrigin)) allowedOrigins.push(onionOrigin);
+  }
   if (allowedOrigins.length > 0) {
     app.use(cors({ origin: allowedOrigins }));
   }
   // The app is served same-origin; without ALLOWED_ORIGINS no CORS headers are
   // emitted, so browsers on other origins cannot call the API.
 
+  const connectSrc: string[] = ["'self'", 'ws:', 'wss:'];
+  // Allow the WebSocket upgrade from the hidden service origin so the browser
+  // does not block the connection when loaded over the .onion address.
+  if (onion) connectSrc.push(`ws://${onion}`, `wss://${onion}`);
+
   app.use(helmet({
     contentSecurityPolicy: isProd
       ? {
           directives: {
             ...helmet.contentSecurityPolicy.getDefaultDirectives(),
-            'connect-src': ["'self'", 'ws:', 'wss:'],
+            'connect-src': connectSrc,
           },
         }
       : false, // Vite dev middleware needs inline scripts
   }));
   app.use(express.json());
 
-  const generalLimiter = createRateLimiter({ windowMs: REST_LIMITS.WINDOW_MS, max: REST_LIMITS.GENERAL_PER_WINDOW });
-  const createLimiter = createRateLimiter({ windowMs: REST_LIMITS.WINDOW_MS, max: REST_LIMITS.SESSION_CREATE_PER_WINDOW });
+  const generalLimiter = createRateLimiter({ windowMs: REST_LIMITS.WINDOW_MS, max: REST_LIMITS.GENERAL_PER_WINDOW, skip: torMode });
+  const createLimiter = createRateLimiter({ windowMs: REST_LIMITS.WINDOW_MS, max: REST_LIMITS.SESSION_CREATE_PER_WINDOW, skip: torMode });
   app.use('/api', generalLimiter);
 
   // API Routes

@@ -8,7 +8,7 @@ import { RelayEnvelopeSchema } from '../../../shared/contracts/v1/schemas';
 import { ISessionStore } from '../../application/ports/session-store.port';
 import { Session, SessionStatus } from '../../../shared/contracts/v1/session';
 import { RELAY_LIMITS, SESSION_LIMITS } from '../../core/constants';
-import { safeEqual, newToken, clientIp, isAllowedOrigin } from '../../core/security';
+import { safeEqual, newToken, clientIp, isAllowedOrigin, torMode } from '../../core/security';
 import { decodeToken, verifyMembership, JoinProof } from '../../../shared/membership';
 
 export class WsTransport implements IRelayTransport {
@@ -57,6 +57,9 @@ export class WsTransport implements IRelayTransport {
   }
 
   private checkIpLimit(req: IncomingMessage): boolean {
+    // In Tor mode every connection arrives from 127.0.0.1; per-IP limiting
+    // would throttle all peers at once, so we skip it entirely.
+    if (torMode()) return true;
     const ip = clientIp(req);
     const now = Date.now();
     const counter = this.ipCounters.get(ip) || { count: 0, lastReset: now };

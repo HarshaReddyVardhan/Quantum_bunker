@@ -16,6 +16,21 @@ export function trustProxy(): boolean {
   return process.env.TRUST_PROXY === 'true' || process.env.TRUST_PROXY === '1';
 }
 
+// When TOR_MODE is enabled the server is exposed solely via a Tor hidden
+// service. All TCP connections arrive from localhost (127.0.0.1), so
+// per-IP rate limiting based on the remote address is meaningless and
+// would wrongly throttle all peers simultaneously.
+export function torMode(): boolean {
+  return process.env.TOR_MODE === 'true' || process.env.TOR_MODE === '1';
+}
+
+// The v3 .onion hostname (without scheme/port) set via ONION_ADDRESS is
+// added automatically to CORS allowed origins and the CSP connect-src
+// directive so the app works correctly when loaded from a hidden service.
+export function onionAddress(): string | null {
+  return process.env.ONION_ADDRESS?.trim() || null;
+}
+
 export function clientIp(req: IncomingMessage): string {
   if (trustProxy()) {
     const forwarded = req.headers['x-forwarded-for'];
