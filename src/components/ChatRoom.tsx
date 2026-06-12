@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search, Pencil, Check, Ban, Paperclip, Download, FileText, Mic } from 'lucide-react';
+import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search, Pencil, Check, Ban, Paperclip, Download, FileText, Mic, Lock, LockKeyhole, Loader2 } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useRelay } from '../useRelay';
 import { normalizeQuery, messageMatches, splitOnQuery } from '../message-search';
-import { attachmentKind, attachmentDataUrl, formatBytes, MAX_FILE_BYTES } from '../file-transfer';
+import { attachmentKind, attachmentDataUrl, formatBytes, MAX_FILE_BYTES, FileAttachment } from '../file-transfer';
+import { decryptFileData, FileCipher } from '../file-crypto';
+import { toBase64 } from '../crypto/noise-primitives';
 import { VOICE_MIME_CANDIDATES, chooseSupportedMime, voiceFileName } from '../voice-record';
 import FingerprintCard from './FingerprintCard';
 
@@ -67,6 +69,61 @@ function renderAttachment(att: import('../file-transfer').FileAttachment): React
   );
 }
 
+// A received file carrying a password lock. The blob is already E2E-decrypted by
+// the ratchet; this gate is the additional password layer — the recipient must
+// enter the out-of-band secret to reveal the file.
+function LockedAttachment({ att }: { att: FileAttachment }) {
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [revealed, setRevealed] = useState<FileAttachment | null>(null);
+
+  if (revealed) return <>{renderAttachment(revealed)}</>;
+
+  const unlock = async () => {
+    if (!password || !att.enc) return;
+    setBusy(true);
+    setError(null);
+    const bytes = await decryptFileData(att.data, att.enc, password);
+    setBusy(false);
+    if (!bytes) {
+      setError('Wrong password');
+      return;
+    }
+    setRevealed({ name: att.name, mime: att.mime, size: att.size, data: toBase64(bytes) });
+  };
+
+  return (
+    <div className="flex flex-col gap-2 px-3 py-2.5 border border-amber-500/30 bg-amber-500/5">
+      <div className="flex items-center gap-2 min-w-0">
+        <LockKeyhole size={16} className="text-amber-600 dark:text-amber-400 shrink-0" />
+        <span className="min-w-0">
+          <span className="block text-xs font-mono text-slate-700 dark:text-slate-200 truncate">{att.name}</span>
+          <span className="block text-[9px] font-mono text-slate-400">{formatBytes(att.size)} · password-protected · {att.enc?.algo}</span>
+        </span>
+      </div>
+      <div className="flex items-center gap-2">
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') void unlock(); }}
+          placeholder="Enter password to unlock"
+          className="flex-1 bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 outline-none focus:border-amber-500/50 text-xs font-mono text-slate-700 dark:text-slate-300 px-2 py-1.5"
+        />
+        <button
+          onClick={() => void unlock()}
+          disabled={!password || busy}
+          className="flex items-center gap-1 text-[10px] font-mono uppercase text-amber-600 dark:text-amber-400 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-30 px-2.5 py-1.5"
+        >
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <Lock size={12} />} Unlock
+        </button>
+      </div>
+      {error && <span className="text-[9px] font-mono uppercase text-red-500">{error}</span>}
+    </div>
+  );
+}
+
 function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft, isExpired, securityOptions, reset }: ChatRoomProps) {
   const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendFile, editMessage, deleteMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport } = useRelay(sessionId, peerId);
   const [input, setInput] = useState('');
@@ -83,6 +140,9 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
   const [isDragging, setIsDragging] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [pwModal, setPwModal] = useState<{ files: File[]; password: string; confirm: string; algo: FileCipher } | null>(null);
+  const protectNextRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -122,16 +182,48 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
     cancelEdit();
   };
 
+  const reportFileError = (file: File, error?: string) => {
+    setFileError(error === 'File exceeds size limit'
+      ? `${file.name} exceeds the ${formatBytes(MAX_FILE_BYTES)} limit`
+      : error || 'Upload failed');
+  };
+
   const handleFiles = async (files: FileList | File[] | null) => {
     if (!files) return;
     setFileError(null);
     for (const file of Array.from(files)) {
       const res = await sendFile(file);
-      if (!res.ok) {
-        setFileError(res.error === 'File exceeds size limit'
-          ? `${file.name} exceeds the ${formatBytes(MAX_FILE_BYTES)} limit`
-          : res.error || 'Upload failed');
-      }
+      if (!res.ok) reportFileError(file, res.error);
+    }
+  };
+
+  const onPickFiles = (fileList: FileList | null) => {
+    const files = Array.from(fileList ?? []);
+    if (files.length === 0) return;
+    if (protectNextRef.current) {
+      protectNextRef.current = false;
+      setPwModal({ files, password: '', confirm: '', algo: 'AES-GCM' });
+    } else {
+      void handleFiles(files);
+    }
+  };
+
+  const openFilePicker = (protect: boolean) => {
+    protectNextRef.current = protect;
+    setAttachMenuOpen(false);
+    fileInputRef.current?.click();
+  };
+
+  const submitProtected = async () => {
+    if (!pwModal) return;
+    if (!pwModal.password) { setFileError('Password required'); return; }
+    if (pwModal.password !== pwModal.confirm) { setFileError('Passwords do not match'); return; }
+    const { files, password, algo } = pwModal;
+    setPwModal(null);
+    setFileError(null);
+    for (const file of files) {
+      const res = await sendFile(file, { password, algo });
+      if (!res.ok) reportFileError(file, res.error);
     }
   };
 
@@ -154,7 +246,13 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
     }
     const mime = chooseSupportedMime(VOICE_MIME_CANDIDATES, (m) => MediaRecorder.isTypeSupported(m));
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       audioStreamRef.current = stream;
       const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
       audioChunksRef.current = [];
@@ -460,7 +558,10 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
                       onTouchStart={() => { if (!isMe) markAsRead(msg.nonce); }}
                     >
                       <div className={`relative z-10 ${antiCaptureTextClass}`}>
-                        {msg.file ? renderAttachment(msg.file) : (trimmedQuery ? highlightMatches(msg.payload, trimmedQuery) : msg.payload)}
+                        {msg.file
+                          ? (msg.file.enc ? <LockedAttachment att={msg.file} /> : renderAttachment(msg.file))
+                          : (trimmedQuery ? highlightMatches(msg.payload, trimmedQuery) : msg.payload)}
+                        {msg.locked && <span className="mt-1 flex items-center gap-1 text-[9px] font-mono uppercase text-amber-600 dark:text-amber-400"><LockKeyhole size={10} /> password-protected · share the password separately</span>}
                         {msg.edited && <span className="ml-2 text-[9px] text-slate-400 dark:text-slate-600 italic">(edited)</span>}
                       </div>
                       <div className="absolute inset-0 bg-gradient-to-br from-black/[0.01] dark:from-white/[0.02] to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
@@ -528,17 +629,48 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
               type="file"
               multiple
               className="hidden"
-              onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }}
+              onChange={(e) => { onPickFiles(e.target.files); e.target.value = ''; }}
             />
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={!isConnected || activePeers.length <= 1 || isPending}
-              title={`Attach file (max ${formatBytes(MAX_FILE_BYTES)}, encrypted before relay)`}
-              className="px-4 border border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400 hover:border-cyan-500/40 transition-colors disabled:opacity-20 flex items-center"
-            >
-              <Paperclip size={16} />
-            </button>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setAttachMenuOpen(o => !o)}
+                disabled={!isConnected || activePeers.length <= 1 || isPending}
+                title={`Attach file (max ${formatBytes(MAX_FILE_BYTES)}, encrypted before relay)`}
+                className="h-full px-4 border border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400 hover:border-cyan-500/40 transition-colors disabled:opacity-20 flex items-center"
+              >
+                <Paperclip size={16} />
+              </button>
+              {attachMenuOpen && (
+                <>
+                  <div className="fixed inset-0 z-[80]" onClick={() => setAttachMenuOpen(false)} />
+                  <div className="absolute bottom-full mb-2 left-0 z-[90] w-60 bg-ui-elevated dark:bg-brand-elevated border border-black/10 dark:border-white/10 shadow-2xl">
+                    <button
+                      type="button"
+                      onClick={() => openFilePicker(true)}
+                      className="w-full flex items-start gap-2.5 px-3 py-2.5 text-left hover:bg-amber-500/10 transition-colors border-b border-black/5 dark:border-white/5"
+                    >
+                      <LockKeyhole size={15} className="text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                      <span>
+                        <span className="block text-xs font-mono font-bold text-slate-700 dark:text-slate-200">Password protected</span>
+                        <span className="block text-[9px] font-mono text-slate-400">E2E encrypted + an extra password lock</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openFilePicker(false)}
+                      className="w-full flex items-start gap-2.5 px-3 py-2.5 text-left hover:bg-cyan-500/10 transition-colors"
+                    >
+                      <ShieldCheck size={15} className="text-cyan-600 dark:text-cyan-400 shrink-0 mt-0.5" />
+                      <span>
+                        <span className="block text-xs font-mono font-bold text-slate-700 dark:text-slate-200">Send regular</span>
+                        <span className="block text-[9px] font-mono text-slate-400">E2E encrypted end-to-end</span>
+                      </span>
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
             <button
               type="button"
               onMouseDown={() => void startRecording()}
@@ -571,6 +703,62 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
           </form>
         </div>
       </section>
+
+      {pwModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setPwModal(null)}>
+          <div className="w-full max-w-md bg-ui-elevated dark:bg-brand-elevated border border-black/10 dark:border-white/10 shadow-2xl p-6 flex flex-col gap-4" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-2">
+              <LockKeyhole size={18} className="text-amber-600 dark:text-amber-400" />
+              <h3 className="font-mono text-sm font-bold uppercase tracking-widest text-slate-700 dark:text-slate-200">Password protect</h3>
+              <button onClick={() => setPwModal(null)} className="ml-auto text-slate-500 hover:text-slate-900 dark:hover:text-white"><X size={16} /></button>
+            </div>
+            <p className="text-[10px] font-mono text-slate-400 leading-relaxed">
+              {pwModal.files.length === 1 ? pwModal.files[0].name : `${pwModal.files.length} files`} will be encrypted with this password on top of the end-to-end channel. Share the password through a separate channel — it is never sent through the vault.
+            </p>
+            <input
+              type="password"
+              autoFocus
+              value={pwModal.password}
+              onChange={(e) => setPwModal(m => m && { ...m, password: e.target.value })}
+              placeholder="Password"
+              className="bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 outline-none focus:border-amber-500/50 text-sm font-mono text-slate-700 dark:text-slate-300 px-3 py-2"
+            />
+            <input
+              type="password"
+              value={pwModal.confirm}
+              onChange={(e) => setPwModal(m => m && { ...m, confirm: e.target.value })}
+              onKeyDown={(e) => { if (e.key === 'Enter') void submitProtected(); }}
+              placeholder="Confirm password"
+              className="bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 outline-none focus:border-amber-500/50 text-sm font-mono text-slate-700 dark:text-slate-300 px-3 py-2"
+            />
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[9px] font-mono uppercase tracking-widest text-slate-500">Cipher</span>
+              <div className="grid grid-cols-2 gap-2">
+                {(['AES-GCM', 'ChaCha20-Poly1305'] as FileCipher[]).map(algo => (
+                  <button
+                    key={algo}
+                    type="button"
+                    onClick={() => setPwModal(m => m && { ...m, algo })}
+                    className={`px-3 py-2 text-[10px] font-mono uppercase border transition-colors ${pwModal.algo === algo ? 'border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400' : 'border-black/10 dark:border-white/10 text-slate-500 hover:border-amber-500/30'}`}
+                  >
+                    {algo}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button onClick={() => setPwModal(null)} className="text-[10px] font-mono uppercase text-slate-500 hover:text-slate-900 dark:hover:text-white px-3 py-2">Cancel</button>
+              <button
+                onClick={() => void submitProtected()}
+                disabled={!pwModal.password || pwModal.password !== pwModal.confirm}
+                className="flex items-center gap-1.5 text-[10px] font-mono uppercase font-bold text-white dark:text-black bg-amber-600 dark:bg-amber-400 enabled:hover:bg-amber-500 disabled:opacity-30 px-4 py-2"
+              >
+                <Lock size={12} /> Encrypt &amp; Send
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Right Sidebar (Event Logs) */}
       <aside className={`w-72 lg:w-64 border-l border-black/5 dark:border-white/5 bg-ui-aside dark:bg-brand-aside p-4 flex flex-col shrink-0 z-[70] ${showRightSidebar ? 'fixed inset-y-0 right-0 shadow-2xl overflow-y-auto' : 'hidden lg:flex'}`}>
