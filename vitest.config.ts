@@ -12,7 +12,15 @@ export default defineConfig({
     },
     coverage: {
       provider: 'v8',
-      reporter: ['text', 'json', 'html'],
+      // json-summary produces coverage/coverage-summary.json, which the
+      // CI pipeline reads to enforce per-metric thresholds.
+      reporter: ['text', 'json', 'json-summary', 'html'],
+      thresholds: {
+        lines: 80,
+        functions: 80,
+        branches: 80,
+        statements: 80,
+      },
     },
   },
 });
