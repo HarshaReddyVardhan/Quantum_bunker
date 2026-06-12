@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search, Pencil, Check, Ban } from 'lucide-react';
+import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search, Pencil, Check, Ban, Paperclip, Download, FileText } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useRelay } from '../useRelay';
 import { normalizeQuery, messageMatches, splitOnQuery } from '../message-search';
+import { attachmentKind, attachmentDataUrl, formatBytes, MAX_FILE_BYTES } from '../file-transfer';
 import FingerprintCard from './FingerprintCard';
 
 interface ChatRoomProps {
@@ -26,8 +27,47 @@ function highlightMatches(text: string, query: string): React.ReactNode {
   );
 }
 
+function renderAttachment(att: import('../file-transfer').FileAttachment): React.ReactNode {
+  const kind = attachmentKind(att.mime);
+  const url = attachmentDataUrl(att);
+  if (kind === 'image') {
+    return (
+      <a href={url} target="_blank" rel="noopener noreferrer" className="block">
+        <img src={url} alt={att.name} className="max-h-64 max-w-full rounded border border-black/10 dark:border-white/10 object-contain" />
+        <span className="block mt-1 text-[9px] font-mono text-slate-400 truncate">{att.name} · {formatBytes(att.size)}</span>
+      </a>
+    );
+  }
+  if (kind === 'audio') {
+    return (
+      <div className="flex flex-col gap-1">
+        <audio controls src={url} className="w-full max-w-xs h-9" />
+        <span className="text-[9px] font-mono text-slate-400 truncate">{att.name} · {formatBytes(att.size)}</span>
+      </div>
+    );
+  }
+  if (kind === 'video') {
+    return (
+      <div className="flex flex-col gap-1">
+        <video controls src={url} className="max-h-64 max-w-full rounded border border-black/10 dark:border-white/10" />
+        <span className="text-[9px] font-mono text-slate-400 truncate">{att.name} · {formatBytes(att.size)}</span>
+      </div>
+    );
+  }
+  return (
+    <a href={url} download={att.name} className="flex items-center gap-3 px-3 py-2 border border-cyan-500/20 bg-cyan-500/5 hover:bg-cyan-500/10 transition-colors">
+      <FileText size={20} className="text-cyan-600 dark:text-cyan-400 shrink-0" />
+      <span className="min-w-0">
+        <span className="block text-xs font-mono text-slate-700 dark:text-slate-200 truncate">{att.name}</span>
+        <span className="block text-[9px] font-mono text-slate-400">{formatBytes(att.size)} · click to download</span>
+      </span>
+      <Download size={14} className="text-slate-400 ml-auto shrink-0" />
+    </a>
+  );
+}
+
 function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft, isExpired, securityOptions, reset }: ChatRoomProps) {
-  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, editMessage, deleteMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport } = useRelay(sessionId, peerId);
+  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendFile, editMessage, deleteMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport } = useRelay(sessionId, peerId);
   const [input, setInput] = useState('');
   const [copied, setCopied] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
@@ -39,6 +79,9 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
   const [searchQuery, setSearchQuery] = useState('');
   const [editingNonce, setEditingNonce] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
+  const [isDragging, setIsDragging] = useState(false);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const shareLink = `${window.location.origin}/join/${sessionId}`;
   const displayName = (id: string) => peerAliases[id] || id.replace('peer-', 'PEER_');
   const trimmedQuery = normalizeQuery(searchQuery);
@@ -72,6 +115,30 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
     const next = editDraft.trim();
     if (next) editMessage(nonce, next);
     cancelEdit();
+  };
+
+  const handleFiles = async (files: FileList | File[] | null) => {
+    if (!files) return;
+    setFileError(null);
+    for (const file of Array.from(files)) {
+      const res = await sendFile(file);
+      if (!res.ok) {
+        setFileError(res.error === 'File exceeds size limit'
+          ? `${file.name} exceeds the ${formatBytes(MAX_FILE_BYTES)} limit`
+          : res.error || 'Upload failed');
+      }
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (activePeers.length > 1) void handleFiles(e.dataTransfer.files);
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const files = Array.from(e.clipboardData.files);
+    if (files.length > 0 && activePeers.length > 1) { e.preventDefault(); void handleFiles(files); }
   };
   const copyId = () => { if (!isConnected) return; navigator.clipboard.writeText(sessionId); setCopied(true); setTimeout(() => setCopied(false), 2000); };
   const copyShareLink = () => { navigator.clipboard.writeText(shareLink); setLinkCopied(true); setTimeout(() => setLinkCopied(false), 2000); };
@@ -282,7 +349,17 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
           </div>
         )}
 
-        <div className="flex-1 p-6 overflow-y-auto flex flex-col gap-6 custom-scrollbar">
+        <div
+          className="flex-1 p-6 overflow-y-auto flex flex-col gap-6 custom-scrollbar relative"
+          onDragOver={(e) => { if (activePeers.length > 1) { e.preventDefault(); setIsDragging(true); } }}
+          onDragLeave={(e) => { if (e.currentTarget === e.target) setIsDragging(false); }}
+          onDrop={handleDrop}
+        >
+          {isDragging && (
+            <div className="absolute inset-2 z-30 border-2 border-dashed border-cyan-500/60 bg-cyan-500/10 backdrop-blur-sm flex items-center justify-center pointer-events-none">
+              <span className="flex items-center gap-2 text-cyan-600 dark:text-cyan-400 font-mono text-xs uppercase tracking-widest"><Paperclip size={16} /> Drop to encrypt &amp; relay</span>
+            </div>
+          )}
           <AnimatePresence initial={false}>
             {visibleMessages.map((msg, i) => {
               const isMe = msg.from === peerId;
@@ -337,13 +414,13 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
                       onTouchStart={() => { if (!isMe) markAsRead(msg.nonce); }}
                     >
                       <div className={`relative z-10 ${antiCaptureTextClass}`}>
-                        {trimmedQuery ? highlightMatches(msg.payload, trimmedQuery) : msg.payload}
+                        {msg.file ? renderAttachment(msg.file) : (trimmedQuery ? highlightMatches(msg.payload, trimmedQuery) : msg.payload)}
                         {msg.edited && <span className="ml-2 text-[9px] text-slate-400 dark:text-slate-600 italic">(edited)</span>}
                       </div>
                       <div className="absolute inset-0 bg-gradient-to-br from-black/[0.01] dark:from-white/[0.02] to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
                       {isMe && (
                         <div className="absolute top-1 right-1 z-20 flex items-center gap-1 opacity-0 group-hover/message:opacity-100 transition-opacity">
-                          <button onClick={() => beginEdit(msg.nonce, msg.payload)} title="Edit message" className="p-1 bg-white/80 dark:bg-black/60 border border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400"><Pencil size={11} /></button>
+                          {!msg.file && <button onClick={() => beginEdit(msg.nonce, msg.payload)} title="Edit message" className="p-1 bg-white/80 dark:bg-black/60 border border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400"><Pencil size={11} /></button>}
                           <button onClick={() => deleteMessage(msg.nonce)} title="Delete message" className="p-1 bg-white/80 dark:bg-black/60 border border-black/10 dark:border-white/10 text-slate-500 hover:text-red-500"><Trash2 size={11} /></button>
                         </div>
                       )}
@@ -387,14 +464,37 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
           )}
         </AnimatePresence>
 
-        <div className="h-20 border-t border-black/5 dark:border-white/5 p-4 shrink-0 bg-ui-elevated dark:bg-brand-elevated">
-          <form onSubmit={handleSend} className="h-full flex gap-4 max-w-5xl mx-auto">
+        <div className="border-t border-black/5 dark:border-white/5 p-4 shrink-0 bg-ui-elevated dark:bg-brand-elevated">
+          {fileError && (
+            <div className="max-w-5xl mx-auto mb-2 flex items-center justify-between gap-2 px-3 py-1.5 bg-red-500/10 border border-red-500/20 text-red-600 dark:text-red-400 text-[10px] font-mono uppercase tracking-tighter">
+              <span className="truncate">{fileError}</span>
+              <button onClick={() => setFileError(null)} className="shrink-0 hover:text-red-800 dark:hover:text-red-200"><X size={12} /></button>
+            </div>
+          )}
+          <form onSubmit={handleSend} className="h-12 flex gap-4 max-w-5xl mx-auto">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => { void handleFiles(e.target.files); e.target.value = ''; }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!isConnected || activePeers.length <= 1 || isPending}
+              title={`Attach file (max ${formatBytes(MAX_FILE_BYTES)}, encrypted before relay)`}
+              className="px-4 border border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400 hover:border-cyan-500/40 transition-colors disabled:opacity-20 flex items-center"
+            >
+              <Paperclip size={16} />
+            </button>
             <div className="flex-1 bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 focus-within:border-cyan-500/50 transition-colors flex items-center px-4 font-mono text-sm group">
               <span className="text-cyan-600 dark:text-cyan-500 mr-3 select-none">$</span>
               <input
                 type="text"
                 value={input}
                 onChange={(e) => { setInput(e.target.value); sendTyping(); }}
+                onPaste={handlePaste}
                 placeholder="Type encrypted payload..."
                 className="flex-1 bg-transparent border-none outline-none text-slate-700 dark:text-slate-300 placeholder:text-slate-400 dark:placeholder:text-slate-700"
                 autoComplete="off"
