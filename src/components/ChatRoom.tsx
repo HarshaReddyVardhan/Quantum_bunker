@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search } from 'lucide-react';
+import { Info, Trash2, ShieldCheck, ShieldAlert, Fingerprint, Radio, Server, Activity, Terminal, X, Share2, QrCode, Search, Pencil, Check, Ban } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useRelay } from '../useRelay';
 import { normalizeQuery, messageMatches, splitOnQuery } from '../message-search';
@@ -27,7 +27,7 @@ function highlightMatches(text: string, query: string): React.ReactNode {
 }
 
 function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft, isExpired, securityOptions, reset }: ChatRoomProps) {
-  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport } = useRelay(sessionId, peerId);
+  const { messages, isConnected, isPending, activePeers, joinRequests, error, isGroup, sendMessage, editMessage, deleteMessage, sendTyping, markAsRead, acceptJoin, rejectJoin, kickPeer, latencyMs, ioLoad, peerAliases, typingPeers, secured, safetyNumbers, fingerprints, ownFingerprint, p2pPeers, transport } = useRelay(sessionId, peerId);
   const [input, setInput] = useState('');
   const [copied, setCopied] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
@@ -37,6 +37,8 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
   const [showLeftSidebar, setShowLeftSidebar] = useState(false);
   const [showRightSidebar, setShowRightSidebar] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [editingNonce, setEditingNonce] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState('');
   const shareLink = `${window.location.origin}/join/${sessionId}`;
   const displayName = (id: string) => peerAliases[id] || id.replace('peer-', 'PEER_');
   const trimmedQuery = normalizeQuery(searchQuery);
@@ -64,6 +66,13 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
   }, [isConnected, error, reset]);
 
   const handleSend = (e: React.FormEvent) => { e.preventDefault(); if (!input.trim()) return; sendMessage(input); setInput(''); };
+  const beginEdit = (nonce: string, current: string) => { setEditingNonce(nonce); setEditDraft(current); };
+  const cancelEdit = () => { setEditingNonce(null); setEditDraft(''); };
+  const commitEdit = (nonce: string) => {
+    const next = editDraft.trim();
+    if (next) editMessage(nonce, next);
+    cancelEdit();
+  };
   const copyId = () => { if (!isConnected) return; navigator.clipboard.writeText(sessionId); setCopied(true); setTimeout(() => setCopied(false), 2000); };
   const copyShareLink = () => { navigator.clipboard.writeText(shareLink); setLinkCopied(true); setTimeout(() => setLinkCopied(false), 2000); };
 
@@ -299,14 +308,47 @@ function ChatRoom({ sessionId, sessionName, peerId, isHost, expiresAt, timeLeft,
                     {isMe && <span className={`text-[10px] font-mono font-bold ${statusColor}`} title={titleText}>{statusText}</span>}
                     {isMe && <span className={`w-1.5 h-1.5 ${dotColor}`} />}
                   </div>
-                  <div
-                    className={`p-4 bg-black/[0.02] dark:bg-white/[0.03] border border-black/5 dark:border-white/5 ${borderClass} text-sm leading-relaxed text-slate-700 dark:text-slate-300 font-mono shadow-sm dark:shadow-xl relative overflow-hidden group transition-all duration-300 ${blurClass}`}
-                    onMouseEnter={() => { if (!isMe) markAsRead(msg.nonce); }}
-                    onTouchStart={() => { if (!isMe) markAsRead(msg.nonce); }}
-                  >
-                    <div className={`relative z-10 ${antiCaptureTextClass}`}>{trimmedQuery ? highlightMatches(msg.payload, trimmedQuery) : msg.payload}</div>
-                    <div className="absolute inset-0 bg-gradient-to-br from-black/[0.01] dark:from-white/[0.02] to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
-                  </div>
+                  {msg.deleted ? (
+                    <div className={`p-4 bg-black/[0.02] dark:bg-white/[0.03] border border-dashed border-black/10 dark:border-white/10 ${borderClass} text-sm text-slate-400 dark:text-slate-600 font-mono italic flex items-center gap-2`}>
+                      <Ban size={13} /> message deleted
+                    </div>
+                  ) : isMe && editingNonce === msg.nonce ? (
+                    <div className={`p-3 bg-black/[0.02] dark:bg-white/[0.03] border border-cyan-500/40 ${borderClass} flex flex-col gap-2`}>
+                      <textarea
+                        autoFocus
+                        value={editDraft}
+                        onChange={(e) => setEditDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitEdit(msg.nonce); }
+                          if (e.key === 'Escape') cancelEdit();
+                        }}
+                        rows={2}
+                        className="w-full bg-white dark:bg-black/40 border border-black/10 dark:border-white/10 outline-none focus:border-cyan-500/50 text-sm font-mono text-slate-700 dark:text-slate-300 p-2 resize-none text-left"
+                      />
+                      <div className="flex items-center justify-end gap-2">
+                        <button onClick={cancelEdit} className="flex items-center gap-1 text-[10px] font-mono uppercase text-slate-500 hover:text-slate-900 dark:hover:text-white px-2 py-1"><X size={12} /> Cancel</button>
+                        <button onClick={() => commitEdit(msg.nonce)} disabled={!editDraft.trim()} className="flex items-center gap-1 text-[10px] font-mono uppercase text-cyan-600 dark:text-cyan-400 border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 disabled:opacity-30 px-2 py-1"><Check size={12} /> Save</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      className={`p-4 bg-black/[0.02] dark:bg-white/[0.03] border border-black/5 dark:border-white/5 ${borderClass} text-sm leading-relaxed text-slate-700 dark:text-slate-300 font-mono shadow-sm dark:shadow-xl relative overflow-hidden group transition-all duration-300 ${blurClass}`}
+                      onMouseEnter={() => { if (!isMe) markAsRead(msg.nonce); }}
+                      onTouchStart={() => { if (!isMe) markAsRead(msg.nonce); }}
+                    >
+                      <div className={`relative z-10 ${antiCaptureTextClass}`}>
+                        {trimmedQuery ? highlightMatches(msg.payload, trimmedQuery) : msg.payload}
+                        {msg.edited && <span className="ml-2 text-[9px] text-slate-400 dark:text-slate-600 italic">(edited)</span>}
+                      </div>
+                      <div className="absolute inset-0 bg-gradient-to-br from-black/[0.01] dark:from-white/[0.02] to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+                      {isMe && (
+                        <div className="absolute top-1 right-1 z-20 flex items-center gap-1 opacity-0 group-hover/message:opacity-100 transition-opacity">
+                          <button onClick={() => beginEdit(msg.nonce, msg.payload)} title="Edit message" className="p-1 bg-white/80 dark:bg-black/60 border border-black/10 dark:border-white/10 text-slate-500 hover:text-cyan-600 dark:hover:text-cyan-400"><Pencil size={11} /></button>
+                          <button onClick={() => deleteMessage(msg.nonce)} title="Delete message" className="p-1 bg-white/80 dark:bg-black/60 border border-black/10 dark:border-white/10 text-slate-500 hover:text-red-500"><Trash2 size={11} /></button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </motion.div>
               );
             })}
