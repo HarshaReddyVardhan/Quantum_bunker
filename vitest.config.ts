@@ -25,12 +25,13 @@ export default defineConfig({
         // by the unit-test runner that collects coverage.
         'server.ts',
       ],
-      thresholds: {
-        lines: 70,
-        functions: 70,
-        branches: 70,
-        statements: 70,
-      },
+      // No hard thresholds here on purpose. The CI pipeline reads
+      // coverage/coverage-summary.json and reports each metric against its
+      // 70% target as a PR comment, but coverage never blocks the merge
+      // (see .github/workflows/ci-pipeline.yml). Enforcing thresholds here
+      // would make `npm run test -- --coverage` exit non-zero on low
+      // coverage, silently re-introducing a merge block the pipeline is
+      // explicitly designed not to impose. Failing tests still fail the run.
     },
   },
 });

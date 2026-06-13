@@ -83,7 +83,7 @@ jobs:
 
       # Parse coverage/coverage-summary.json (produced by the json-summary
       # reporter configured in vitest.config.ts) and check each metric
-      # against the 80 % threshold.
+      # against the 70 % threshold.
       - name: Evaluate coverage thresholds
         id: coverage
         if: always()
