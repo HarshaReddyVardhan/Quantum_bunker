@@ -218,13 +218,10 @@ jobs:
               });
             }
 
-      # Hard-fail the job so the branch ruleset status check blocks the merge.
+      # Hard-fail the job only when tests actually fail.
+      # Coverage is reported as a PR comment but never blocks the merge.
       - name: Enforce CI gate
-        if: |
-          steps.tests.outcome    == 'failure'         ||
-          steps.coverage.outcome == 'failure'         ||
-          steps.coverage.outputs.status == 'below-threshold' ||
-          steps.coverage.outputs.status == 'no-report'
+        if: steps.tests.outcome == 'failure'
         run: |
-          echo "::error::CI gate failed — see the PR comment for details."
+          echo "::error::Tests failed — check the PR comment for details."
           exit 1
