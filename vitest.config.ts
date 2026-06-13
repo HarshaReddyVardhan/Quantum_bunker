@@ -15,6 +15,16 @@ export default defineConfig({
       // json-summary produces coverage/coverage-summary.json, which the
       // CI pipeline reads to enforce per-metric thresholds.
       reporter: ['text', 'json', 'json-summary', 'html'],
+      exclude: [
+        // RTCPeerConnection / RTCDataChannel are browser-only APIs; this file
+        // cannot execute in Node.js. The two pure utility functions it exports
+        // (isOfferer, shouldUseP2P) are covered by webrtc-mesh.test.ts.
+        'src/transport/webrtc-mesh.ts',
+        // Entry-point wiring: Express + Vite middleware + WS scheduler.
+        // Branches here are exercised by smoke and integration tests, not
+        // by the unit-test runner that collects coverage.
+        'server.ts',
+      ],
       thresholds: {
         lines: 80,
         functions: 80,
