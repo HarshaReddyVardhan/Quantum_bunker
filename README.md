@@ -112,6 +112,10 @@ npm run dev
 # 5. Open your browser to the localhost URL shown in the terminal
 ```
 
+> 🧪 **Try it live:** A [development server](https://555c9888-0c33-4aea-af34-9aa04df0f7e6-00-2t1v7p2dekc7n.kirk.replit.dev/) is available for instant testing without local setup.
+
+### Available Scripts
+
 ### Available Scripts
 
 | Script | Description |
